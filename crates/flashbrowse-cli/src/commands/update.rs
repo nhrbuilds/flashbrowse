@@ -334,7 +334,10 @@ async fn install_update(info: &ReleaseInfo, current: &str) -> anyhow::Result<()>
             )
         })?;
 
-    println!("updating flashbrowse {current} -> {} ...", info.tag);
+    crate::write_stdout(format_args!(
+        "updating flashbrowse {current} -> {} ...",
+        info.tag
+    ))?;
     let client = build_http_client().map_err(|e| anyhow::anyhow!(e))?;
     let resp = client
         .get(&asset.download_url)
@@ -351,7 +354,11 @@ async fn install_update(info: &ReleaseInfo, current: &str) -> anyhow::Result<()>
     let binary_bytes = extract_binary(archive_name, &archive_bytes, binary_name)?;
     let exe_path = std::env::current_exe().context("failed to locate current executable")?;
     replace_binary_at(&exe_path, &binary_bytes)?;
-    println!("updated {} to {}", exe_path.display(), info.tag);
+    crate::write_stdout(format_args!(
+        "updated {} to {}",
+        exe_path.display(),
+        info.tag
+    ))?;
     Ok(())
 }
 
@@ -360,29 +367,34 @@ pub async fn run(check_only: bool) -> anyhow::Result<()> {
     let channel = Channel::from_env();
     let current = env!("CARGO_PKG_VERSION");
     if channel == Channel::Off {
-        println!("update channel is 'off' (FLASHBROWSE_UPDATE_CHANNEL=off)");
+        crate::write_stdout(format_args!(
+            "update channel is 'off' (FLASHBROWSE_UPDATE_CHANNEL=off)"
+        ))?;
         return Ok(());
     }
     match latest_release(channel).await {
         Ok(info) => {
             if is_newer(&info.tag, current) {
                 if check_only {
-                    println!("update available: {current} -> {}", info.tag);
-                    println!("  {}", info.url);
+                    crate::write_stdout(format_args!(
+                        "update available: {current} -> {}",
+                        info.tag
+                    ))?;
+                    crate::write_stdout(format_args!("  {}", info.url))?;
                 } else {
                     install_update(&info, current).await?;
                 }
             } else {
-                println!(
+                crate::write_stdout(format_args!(
                     "flashbrowse {current} is up to date (channel: {})",
                     channel.name()
-                );
+                ))?;
             }
         }
         Err(e) => {
             if check_only {
                 // Never fail a check command when offline or rate-limited.
-                eprintln!("update check skipped: {e}");
+                crate::write_stderr(format_args!("update check skipped: {e}"));
             } else {
                 anyhow::bail!("update failed: {e}");
             }

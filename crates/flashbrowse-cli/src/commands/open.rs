@@ -34,6 +34,7 @@ pub async fn run(
     if let Some(id) = session_id.as_deref() {
         crate::commands::session_file::validate_session_id(id)?;
     }
+    let owned_profile = user_data_dir.is_none() && cdp_url.is_none();
     let config = SessionConfig {
         chrome_path,
         resource_policy,
@@ -66,17 +67,19 @@ pub async fn run(
             let payload = (tree.len(), observability::count_actions(&tree));
             match session_id {
                 Some(id) => {
+                    let metadata = session.detached_metadata();
+                    write_session(&id, &metadata, owned_profile)?;
                     let detached = session.detach();
-                    write_session(&id, &detached)?;
-                    println!("{tree}");
-                    println!(
+                    crate::write_stdout(format_args!("{tree}"))?;
+                    crate::write_stdout(format_args!(
                         "(persistent session '{id}' pid {} - 'flashbrowse close --session-id {id}' to stop)",
                         detached.pid
-                    );
+                    ))?;
                 }
                 None => {
-                    println!("{tree}");
+                    let written = crate::write_stdout(format_args!("{tree}"));
                     session.shutdown().await;
+                    written?;
                 }
             }
             observability::record_op_with_settle(

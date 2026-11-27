@@ -2,7 +2,9 @@
 
 ## Pre-flight
 - [ ] `git status` clean, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (incl. stress)
-- [ ] `node scripts/soak.mjs --minutes 120 --url <url> --out soak-report.json` (1-2 h soak, machine idle, results attached to the release notes)
+- [ ] `cargo build --release --workspace` to verify the optimized release
+      profile and panic-unwind requirement.
+- [ ] `node scripts/soak.mjs --minutes 30 --url <url> --out eval/results/soak-vX.Y.Z.json` (machine idle, run against the final release build and attach the report to the release notes).
 - [ ] `node scripts/soak.mjs --minutes 5 ...` smoke (the same harness CI runs)
 - [ ] Re-run the sequential benchmark on an idle machine and update the numbers in `README.md`
 - [ ] Bump `workspace.package.version` in `Cargo.toml` and `CHANGELOG.md` with date + highlights

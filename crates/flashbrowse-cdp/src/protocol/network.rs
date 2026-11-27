@@ -1,6 +1,8 @@
 //! `Network` domain types (enable, setBlockedURLs, setExtraHTTPHeaders).
 
-use serde::Serialize;
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::CdpError;
 use crate::transport::CdpClient;
@@ -35,4 +37,44 @@ pub async fn set_blocked_urls(
         )
         .await?;
     Ok(())
+}
+
+/// `Network.setExtraHTTPHeaders` - send additional HTTP headers on every request in this session.
+pub async fn set_extra_http_headers(
+    client: &CdpClient,
+    session_id: &str,
+    headers: &HashMap<String, String>,
+) -> Result<(), CdpError> {
+    let _: serde_json::Value = client
+        .send(
+            Some(session_id),
+            "Network.setExtraHTTPHeaders",
+            serde_json::json!({ "headers": headers }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Response of `Network.getResponseBody`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetResponseBodyResponse {
+    pub body: String,
+    #[serde(default)]
+    pub base64_encoded: bool,
+}
+
+/// `Network.getResponseBody` - retrieve the captured body for a `requestId`.
+pub async fn get_response_body(
+    client: &CdpClient,
+    session_id: &str,
+    request_id: &str,
+) -> Result<GetResponseBodyResponse, CdpError> {
+    client
+        .send_typed(
+            Some(session_id),
+            "Network.getResponseBody",
+            &serde_json::json!({ "requestId": request_id }),
+        )
+        .await
 }

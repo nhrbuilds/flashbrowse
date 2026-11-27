@@ -16,33 +16,41 @@ use flashbrowse_core::{BrowserSession, SessionConfig};
 
 /// Minimal single-file HTTP server: serves the fixture for any path.
 fn spawn_fixture_server(html: &'static str) -> (u16, Arc<std::thread::JoinHandle<()>>) {
+    use std::net::Shutdown;
+    use std::time::Duration;
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let handle = std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            // Drain the request head.
-            {
-                let mut reader = BufReader::new(match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                });
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if line == "\r\n" || line == "\n" {
-                        break;
+            let Ok(stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                // Drain the request head.
+                if let Ok(cloned) = stream.try_clone() {
+                    let mut reader = BufReader::new(cloned);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
                     }
-                    line.clear();
+                    while line != "\r\n" && line != "\n" {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            break;
+                        }
+                    }
                 }
-            }
-            let body = html;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(body.as_bytes());
-            let _ = stream.flush();
+                let body = html;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(body.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            });
         }
     });
     (port, Arc::new(handle))

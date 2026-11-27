@@ -1,0 +1,181 @@
+{
+  "generatedAt": "2026-11-27T00:58:15.452Z",
+  "binary": "./target/release/flashbrowse",
+  "pages": [
+    {
+      "url": "http://127.0.0.1:8099/a11y.html",
+      "ok": true,
+      "ms": 807,
+      "staticTexts": 0,
+      "missing": [],
+      "rawBytes": 13846,
+      "treeBytes": 550,
+      "reduction": 0.960277336414849
+    },
+    {
+      "url": "http://127.0.0.1:8099/contenteditable.html",
+      "ok": true,
+      "ms": 1730,
+      "staticTexts": 0,
+      "missing": [],
+      "rawBytes": 3661,
+      "treeBytes": 143,
+      "reduction": 0.960939633979787
+    },
+    {
+      "url": "http://127.0.0.1:8099/forms.html",
+      "ok": true,
+      "ms": 817,
+      "staticTexts": 7,
+      "missing": [],
+      "rawBytes": 18552,
+      "treeBytes": 858,
+      "reduction": 0.953751617076326
+    },
+    {
+      "url": "http://127.0.0.1:8099/frames.html",
+      "ok": true,
+      "ms": 1711,
+      "staticTexts": 3,
+      "missing": [],
+      "rawBytes": 5790,
+      "treeBytes": 332,
+      "reduction": 0.9426597582037997
+    },
+    {
+      "url": "http://127.0.0.1:8099/heavy-table.html",
+      "ok": true,
+      "ms": 979,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 458954,
+      "treeBytes": 6949,
+      "reduction": 0.9848590490550251
+    },
+    {
+      "url": "http://127.0.0.1:8099/index.html",
+      "ok": true,
+      "ms": 824,
+      "staticTexts": 35,
+      "missing": [],
+      "rawBytes": 77127,
+      "treeBytes": 5272,
+      "reduction": 0.9316452085521283
+    },
+    {
+      "url": "http://127.0.0.1:8099/lazy-tabs.html",
+      "ok": true,
+      "ms": 1686,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 3644,
+      "treeBytes": 168,
+      "reduction": 0.9538968166849616
+    },
+    {
+      "url": "http://127.0.0.1:8099/many-buttons.html",
+      "ok": true,
+      "ms": 960,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 51654,
+      "treeBytes": 1817,
+      "reduction": 0.9648236341812831
+    },
+    {
+      "url": "http://127.0.0.1:8099/modal-dialog.html",
+      "ok": true,
+      "ms": 1800,
+      "staticTexts": 0,
+      "missing": [],
+      "rawBytes": 2428,
+      "treeBytes": 106,
+      "reduction": 0.9563426688632619
+    },
+    {
+      "url": "http://127.0.0.1:8099/nested-depth.html",
+      "ok": true,
+      "ms": 1703,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 1612,
+      "treeBytes": 106,
+      "reduction": 0.93424317617866
+    },
+    {
+      "url": "http://127.0.0.1:8099/shadow.html",
+      "ok": true,
+      "ms": 1709,
+      "staticTexts": 3,
+      "missing": [],
+      "rawBytes": 4941,
+      "treeBytes": 326,
+      "reduction": 0.9340214531471362
+    },
+    {
+      "url": "http://127.0.0.1:8099/spatial.html",
+      "ok": true,
+      "ms": 835,
+      "staticTexts": 6,
+      "missing": [],
+      "rawBytes": 6882,
+      "treeBytes": 376,
+      "reduction": 0.945364719558268
+    },
+    {
+      "url": "http://127.0.0.1:8099/table.html",
+      "ok": true,
+      "ms": 854,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 123979,
+      "treeBytes": 2134,
+      "reduction": 0.9827874075448262
+    },
+    {
+      "url": "http://127.0.0.1:8099/unicode.html",
+      "ok": true,
+      "ms": 894,
+      "staticTexts": 3,
+      "missing": [],
+      "rawBytes": 6495,
+      "treeBytes": 644,
+      "reduction": 0.900846805234796
+    },
+    {
+      "url": "https://example.com",
+      "ok": true,
+      "ms": 1810,
+      "staticTexts": 6,
+      "missing": [],
+      "rawBytes": 11752,
+      "treeBytes": 1128,
+      "reduction": 0.9040163376446563
+    },
+    {
+      "url": "https://news.ycombinator.com",
+      "ok": true,
+      "ms": 2744,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 409594,
+      "treeBytes": 14262,
+      "reduction": 0.9651801540061622
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Main_Page",
+      "ok": true,
+      "ms": 2576,
+      "staticTexts": 278,
+      "missing": [],
+      "rawBytes": 1338436,
+      "treeBytes": 91369,
+      "reduction": 0.931734502060614
+    }
+  ],
+  "summary": {
+    "pages": 17,
+    "failed": 0,
+    "missing": 0
+  }
+}

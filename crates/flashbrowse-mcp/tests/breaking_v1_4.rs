@@ -1,7 +1,7 @@
 //! Breaking-point stress tests for v1.4.0 capabilities over the full
 //! MCP -> Core -> POSIX pipe -> Chrome stack.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 
 use flashbrowse_core::SessionConfig;
@@ -54,24 +54,44 @@ fn spawn_test_http<F>(handler: F) -> u16
 where
     F: Fn(&str) -> String + Send + Sync + 'static,
 {
+    use std::io::{BufRead, BufReader as StdBufReader};
+    use std::net::Shutdown;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
+    let handler = Arc::new(handler);
     std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut buf = [0u8; 2048];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("/");
-            let body = handler(path);
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes());
+        for stream in listener.incoming().flatten() {
+            let handler = Arc::clone(&handler);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request_line = String::new();
+                if let Ok(cloned) = stream.try_clone() {
+                    let mut reader = StdBufReader::new(cloned);
+                    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        line.clear();
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                let body = handler(path);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            });
         }
     });
     port

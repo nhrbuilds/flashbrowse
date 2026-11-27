@@ -1,10 +1,13 @@
 //! MCP tool definitions and execution.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use flashbrowse_core::actions::ScrollDirection;
 use flashbrowse_core::{
-    normalize_url, BrowserSession, ResourcePolicy, ScreenshotOptions, SessionConfig,
+    normalize_url, BrowserSession, EmulationOptions, GeolocationOptions, PdfOptions,
+    ResourcePolicy, RouteRule, ScreenshotOptions, SessionConfig, ViewportOptions, WaitCondition,
     SCREENSHOT_PREPARE_MS_DEFAULT, SCREENSHOT_PREPARE_MS_MAX,
 };
 use serde_json::Value;
@@ -12,8 +15,98 @@ use tokio::sync::Mutex;
 
 use crate::protocol::{McpError, ToolResult};
 
-/// The single browser session shared by all `tools/call` invocations.
-pub type SessionHandle = Arc<Mutex<Option<BrowserSession>>>;
+/// Multi-context session manager sharing one Chromium process across isolated contexts.
+pub struct SessionManager {
+    active: String,
+    sessions: HashMap<String, BrowserSession>,
+}
+
+impl SessionManager {
+    pub fn new() -> Self {
+        Self {
+            active: "default".to_string(),
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn active_name(&self) -> &str {
+        &self.active
+    }
+
+    pub fn as_ref(&self) -> Option<&BrowserSession> {
+        self.sessions.get(&self.active)
+    }
+
+    pub fn as_mut(&mut self) -> Option<&mut BrowserSession> {
+        self.sessions.get_mut(&self.active)
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.as_ref().is_none()
+    }
+
+    pub fn session_mut_for(
+        &mut self,
+        context: Option<&str>,
+    ) -> Result<&mut BrowserSession, McpError> {
+        let name = context.unwrap_or(&self.active).to_string();
+        self.sessions.get_mut(&name).ok_or_else(|| {
+            if name == "default" {
+                McpError::Internal("no browser session: call browser_open first".to_string())
+            } else {
+                McpError::InvalidParams(format!("unknown browser context '{name}'"))
+            }
+        })
+    }
+
+    pub async fn shutdown_all(&mut self) {
+        if let Err(error) = flashbrowse_core::async_runtime::run(self.shutdown_all_inner()).await {
+            tracing::warn!(%error, "browser session cleanup could not start");
+        }
+    }
+
+    async fn shutdown_all_inner(&mut self) {
+        // Remove every session from shared state before awaiting teardown. If
+        // this future is cancelled or a session teardown fails, the manager is
+        // already clean and dropping remaining sessions still triggers their
+        // browser process guards.
+        let mut sessions = std::mem::take(&mut self.sessions);
+        self.active = "default".to_string();
+        let default_session = sessions.remove("default");
+        for (name, session) in sessions {
+            shutdown_session(name, session).await;
+        }
+        if let Some(session) = default_session {
+            shutdown_session("default".to_string(), session).await;
+        }
+    }
+}
+
+async fn shutdown_session(name: String, session: BrowserSession) {
+    match flashbrowse_core::async_runtime::run(tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.shutdown(),
+    ))
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            tracing::warn!(context = %name, "browser session cleanup timed out; session dropped")
+        }
+        Err(error) => {
+            tracing::error!(context = %name, %error, "browser session cleanup panicked and was contained");
+        }
+    }
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Shared session manager across all `tools/call` invocations.
+pub type SessionHandle = Arc<Mutex<SessionManager>>;
 
 /// Parameter schema for tools that need no arguments except an explicit
 /// `{}` object is still valid per MCP's `inputSchema` requirement.
@@ -39,18 +132,19 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "browser_act",
-            "description": "Executes an interaction (click, fill, hover, press_key, scroll) against a numbered action element ID.",
+            "description": "Executes an interaction (click, double_click, right_click, drag_and_drop, fill, hover, press_key, scroll, select) against a numbered action element ID.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action_id": {"type": "integer", "description": "Element ID number from the action tree"},
-                    "action": {"type": "string", "enum": ["click", "fill", "hover", "press_key", "scroll", "select"], "description": "Interaction to perform"},
-                    "value": {"type": "string", "description": "Text payload for 'fill', key name for 'press_key', direction for 'scroll', or option label for 'select'"},
+                    "action_id": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Element ID number from the action tree (optional for press_key and viewport scroll)"},
+                    "target_action_id": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Destination element ID for drag_and_drop"},
+                    "action": {"type": "string", "enum": ["click", "double_click", "right_click", "drag_and_drop", "fill", "hover", "press_key", "scroll", "select"], "description": "Interaction to perform"},
+                    "value": {"type": "string", "description": "Text payload for 'fill', key or chord (e.g. Control+K) for 'press_key', direction for 'scroll', or option label for 'select'"},
                     "amount": {"type": "number", "description": "Pixel distance for 'scroll' (default 300)"},
                     "dialog_action": {"type": "string", "enum": ["accept", "dismiss"], "description": "Optional disposition for a native JavaScript dialog opened by this action"},
                     "prompt_text": {"type": "string", "description": "Text supplied only when dialog_action is accept and a prompt opens"}
                 },
-                "required": ["action_id", "action"]
+                "required": ["action"]
             }
         }),
         serde_json::json!({
@@ -71,13 +165,14 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "browser_screenshot",
-            "description": "Captures a viewport or full-page PNG of the current session (after browser_open/browser_act). Waits for images/network to settle. Use this tool instead of a separate browser MCP.",
+            "description": "Captures a viewport, full-page, or element-clipped PNG of the current session (after browser_open/browser_act). Waits for images/network to settle. Use this tool instead of a separate browser MCP.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "full_page": {"type": "boolean", "default": false},
+                    "action_id": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Optional action_id to clip the PNG to that element's bounding box"},
                     "prepare_lazy_content": {"type": "boolean", "description": "Scroll the page to surface lazy-loaded images", "default": true},
-                    "timeout_ms": {"type": "integer", "description": "Max ms to wait before best-effort capture (500-60000)", "default": 8000}
+                    "timeout_ms": {"type": "integer", "minimum": 0, "description": "Max ms to wait before best-effort capture (500-60000)", "default": 8000}
                 }
             }
         }),
@@ -111,7 +206,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action_id": {"type": "integer", "description": "Action ID of an input[type=file]"},
+                    "action_id": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Action ID of an input[type=file]"},
                     "files": {"type": "array", "items": {"type": "string"}, "description": "File names or relative paths under the configured MCP file root"}
                 },
                 "required": ["action_id", "files"]
@@ -125,7 +220,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "action": {"type": "string", "enum": ["list", "wait"], "default": "list"},
                     "guid": {"type": "string", "description": "Download identifier returned by the list action"},
-                    "timeout_ms": {"type": "integer", "default": 10000, "description": "Maximum wait, capped at 20000 ms"}
+                    "timeout_ms": {"type": "integer", "minimum": 0, "default": 10000, "description": "Maximum wait, capped at 20000 ms"}
                 }
             }
         }),
@@ -141,7 +236,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "items": {
                             "type": "object",
                             "properties": {
-                                "action_id": {"type": "integer", "description": "Element ID from the current action tree"},
+                                "action_id": {"type": "integer", "minimum": 0, "maximum": 4294967295u64, "description": "Element ID from the current action tree"},
                                 "value": {"type": "string", "description": "Text value to enter"}
                             },
                             "required": ["action_id", "value"]
@@ -151,7 +246,228 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["fields"]
             }
         }),
+        serde_json::json!({
+            "name": "browser_navigate",
+            "description": "Navigates session history back or forward, or reloads the current page, returning the refreshed semantic tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["back", "forward", "reload"]},
+                    "ignore_cache": {"type": "boolean", "default": false, "description": "Hard reload bypassing cache (only for action=reload)"}
+                },
+                "required": ["action"]
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_wait_for",
+            "description": "Waits for text, a CSS selector (including open shadow roots), a URL substring, or network idle, then returns the refreshed semantic tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Wait until this visible text appears"},
+                    "selector": {"type": "string", "description": "Wait until this CSS selector matches"},
+                    "url": {"type": "string", "description": "Wait until location.href contains this substring"},
+                    "network_idle_ms": {"type": "integer", "minimum": 0, "description": "Wait until network has been idle for this many ms"},
+                    "timeout_ms": {"type": "integer", "minimum": 0, "default": 10000, "description": "Max wait duration in ms (100-30000)"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_console",
+            "description": "Lists or clears captured browser console messages and uncaught JavaScript exceptions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "clear"], "default": "list"},
+                    "level": {"type": "string", "description": "Optional filter: log, warning, error, info, debug, exception"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_network",
+            "description": "Lists captured network requests, reads a response body by request_id, clears logs, or sets extra HTTP headers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "body", "clear", "set_headers"], "default": "list"},
+                    "failed_only": {"type": "boolean", "default": false, "description": "Only return failed or >=400 responses (for action=list)"},
+                    "request_id": {"type": "string", "description": "Request ID from list (for action=body)"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Key-value map of extra HTTP headers (for action=set_headers)"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_route",
+            "description": "Adds, lists, or clears lazy Fetch request interception rules to mock responses or abort matching URLs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "list", "clear"], "default": "list"},
+                    "url_pattern": {"type": "string", "description": "Substring or wildcard (*) URL pattern (required for action=add)"},
+                    "status": {"type": "integer", "default": 200, "description": "HTTP status code for mocked response"},
+                    "content_type": {"type": "string", "default": "application/json", "description": "Content-Type header for mocked response"},
+                    "body": {"type": "string", "default": "", "description": "Response body text"},
+                    "abort": {"type": "boolean", "default": false, "description": "If true, abort matching requests instead of fulfilling"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_contexts",
+            "description": "Lists, creates, selects, or closes isolated incognito-like browser contexts sharing one Chrome process.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "create", "select", "close"], "default": "list"},
+                    "name": {"type": "string", "description": "Context name (required for create, select, close; cannot close 'default')"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_emulate",
+            "description": "Configures viewport/mobile emulation, timezone, locale, geolocation, and browser permissions on the active session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "viewport": {
+                        "type": "object",
+                        "properties": {
+                            "width": {"type": "integer"},
+                            "height": {"type": "integer"},
+                            "device_scale_factor": {"type": "number", "default": 1.0},
+                            "mobile": {"type": "boolean", "default": false}
+                        },
+                        "required": ["width", "height"]
+                    },
+                    "timezone": {"type": "string", "description": "IANA timezone ID (e.g. Asia/Tokyo)"},
+                    "locale": {"type": "string", "description": "BCP-47 locale (e.g. ja-JP)"},
+                    "geolocation": {
+                        "type": "object",
+                        "properties": {
+                            "latitude": {"type": "number"},
+                            "longitude": {"type": "number"},
+                            "accuracy": {"type": "number", "default": 10.0}
+                        },
+                        "required": ["latitude", "longitude"]
+                    },
+                    "permissions": {
+                        "type": "object",
+                        "properties": {
+                            "origin": {"type": "string"},
+                            "grants": {"type": "array", "items": {"type": "string"}}
+                        },
+                        "required": ["grants"]
+                    },
+                    "reset": {"type": "boolean", "default": false, "description": "Clear device metrics, geolocation, and permission overrides"}
+                }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_pdf",
+            "description": "Exports the current page to a PDF file confined under the configured MCP file root's pdfs directory and returns {path, bytes}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Simple file name without path or extension"},
+                    "landscape": {"type": "boolean", "default": false},
+                    "print_background": {"type": "boolean", "default": true},
+                    "scale": {"type": "number", "default": 1.0}
+                },
+                "required": ["name"]
+            }
+        }),
     ]
+}
+
+fn validate_tool_arguments(name: &str, arguments: &Value) -> Result<(), McpError> {
+    static DEFINITIONS: OnceLock<Vec<Value>> = OnceLock::new();
+    let definition = DEFINITIONS
+        .get_or_init(tool_definitions)
+        .iter()
+        .find(|definition| definition.get("name").and_then(Value::as_str) == Some(name));
+    if let Some(schema) = definition.and_then(|definition| definition.get("inputSchema")) {
+        validate_value(schema, arguments, "arguments")?;
+    }
+    Ok(())
+}
+
+fn validate_value(schema: &Value, value: &Value, path: &str) -> Result<(), McpError> {
+    let kind = schema.get("type").and_then(Value::as_str).unwrap_or("");
+    let valid = match kind {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        _ => true,
+    };
+    if !valid {
+        return Err(McpError::InvalidParams(format!("'{path}' must be {kind}")));
+    }
+    if let Some(number) = value.as_f64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|min| number < min)
+            || schema
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|max| number > max)
+        {
+            return Err(McpError::InvalidParams(format!("'{path}' is out of range")));
+        }
+    }
+    if let Some(choices) = schema.get("enum").and_then(Value::as_array) {
+        let policy_alias = path == "arguments.resource_policy"
+            && value
+                .as_str()
+                .is_some_and(|policy| policy.parse::<ResourcePolicy>().is_ok());
+        if !choices.contains(value) && !policy_alias {
+            return Err(McpError::InvalidParams(format!(
+                "'{path}' has an unsupported value"
+            )));
+        }
+    }
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(key) {
+                    return Err(McpError::InvalidParams(format!(
+                        "missing required '{path}.{key}'"
+                    )));
+                }
+            }
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (key, value) in object {
+                if let Some(property) = properties.get(key) {
+                    let required = schema
+                        .get("required")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(key)));
+                    if value.is_null() && !required {
+                        continue;
+                    }
+                    validate_value(property, value, &format!("{path}.{key}"))?;
+                } else if let Some(property) =
+                    schema.get("additionalProperties").filter(|v| v.is_object())
+                {
+                    validate_value(property, value, &format!("{path}.{key}"))?;
+                }
+            }
+        } else if let Some(property) = schema.get("additionalProperties").filter(|v| v.is_object())
+        {
+            for (key, value) in object {
+                validate_value(property, value, &format!("{path}.{key}"))?;
+            }
+        }
+    }
+    if let (Some(items), Some(values)) = (schema.get("items"), value.as_array()) {
+        for (index, value) in values.iter().enumerate() {
+            validate_value(items, value, &format!("{path}[{index}]"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse `text_only` from args (default `false`).
@@ -209,28 +525,37 @@ async fn ensure_session<'a>(
     handle: &'a SessionHandle,
     default_config: &SessionConfig,
     want_policy: ResourcePolicy,
-) -> Result<tokio::sync::MutexGuard<'a, Option<BrowserSession>>, McpError> {
+) -> Result<tokio::sync::MutexGuard<'a, SessionManager>, McpError> {
     let mut guard = handle.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|session| !session.client().is_connected())
+    {
+        guard.shutdown_all().await;
+    }
     if let Some(session) = guard.as_mut() {
         session
             .set_resource_policy(want_policy)
             .await
             .map_err(|e| McpError::Internal(e.to_string()))?;
-    } else {
+    } else if guard.active == "default" {
         let mut cfg = default_config.clone();
         cfg.resource_policy = want_policy;
         let fresh = BrowserSession::launch(cfg)
             .await
             .map_err(|e| McpError::Internal(e.to_string()))?;
-        *guard = Some(fresh);
+        guard.sessions.insert("default".to_string(), fresh);
+    } else {
+        return Err(McpError::Internal(format!(
+            "active browser context '{}' is not initialized",
+            guard.active
+        )));
     }
     Ok(guard)
 }
 
-fn require_session(guard: &mut Option<BrowserSession>) -> Result<&mut BrowserSession, McpError> {
-    guard.as_mut().ok_or_else(|| {
-        McpError::Internal("no browser session: call browser_open first".to_string())
-    })
+fn require_session(guard: &mut SessionManager) -> Result<&mut BrowserSession, McpError> {
+    guard.session_mut_for(None)
 }
 
 /// Execute one `tools/call`. Returns a `ToolResult` (success or `isError`).
@@ -243,6 +568,18 @@ pub async fn call_tool(
     handle: &SessionHandle,
     default_config: &SessionConfig,
 ) -> Result<ToolResult, McpError> {
+    flashbrowse_core::async_runtime::run(call_tool_inner(name, arguments, handle, default_config))
+        .await
+        .map_err(|error| McpError::Internal(error.to_string()))?
+}
+
+async fn call_tool_inner(
+    name: &str,
+    arguments: &Value,
+    handle: &SessionHandle,
+    default_config: &SessionConfig,
+) -> Result<ToolResult, McpError> {
+    validate_tool_arguments(name, arguments)?;
     let started = std::time::Instant::now();
     let result = match name {
         "browser_open" => call_open(arguments, handle, default_config).await,
@@ -255,6 +592,14 @@ pub async fn call_tool(
         "browser_upload" => call_upload(arguments, handle, default_config).await,
         "browser_downloads" => call_downloads(arguments, handle).await,
         "browser_fill_form" => call_fill_form(arguments, handle).await,
+        "browser_navigate" => call_navigate(arguments, handle).await,
+        "browser_wait_for" => call_wait_for(arguments, handle).await,
+        "browser_console" => call_console(arguments, handle).await,
+        "browser_network" => call_network(arguments, handle).await,
+        "browser_route" => call_route(arguments, handle).await,
+        "browser_contexts" => call_contexts(arguments, handle, default_config).await,
+        "browser_emulate" => call_emulate(arguments, handle).await,
+        "browser_pdf" => call_pdf(arguments, handle, default_config).await,
         other => Err(McpError::InvalidParams(format!("unknown tool '{other}'"))),
     };
     // `open` is the only tool that owns a settle; read it back from the
@@ -278,11 +623,554 @@ fn payload_of(result: &Result<ToolResult, McpError>) -> (usize, usize) {
     let mut actions = 0usize;
     for item in &tr.content {
         if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-            chars += text.len();
-            actions += flashbrowse_core::observability::count_actions(text);
+            chars = chars.saturating_add(text.len());
+            actions = actions.saturating_add(flashbrowse_core::observability::count_actions(text));
         }
     }
     (chars, actions)
+}
+
+async fn call_navigate(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let action = arg_string(arguments, "action")?;
+    let ignore_cache = arg_bool(arguments, "ignore_cache");
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    let res = match action.as_str() {
+        "back" => session.back().await,
+        "forward" => session.forward().await,
+        "reload" => session.reload(ignore_cache).await,
+        other => {
+            return Err(McpError::InvalidParams(format!(
+                "unknown navigate action '{other}' (expected back|forward|reload)"
+            )));
+        }
+    };
+    match res {
+        Ok(tree) => Ok(ToolResult::text(tree)),
+        Err(e) => Ok(ToolResult::error(e.to_string())),
+    }
+}
+
+async fn call_wait_for(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let text = arg_opt_string(arguments, "text");
+    let selector = arg_opt_string(arguments, "selector");
+    let url = arg_opt_string(arguments, "url");
+    let network_idle_ms = arguments.get("network_idle_ms").and_then(|v| v.as_u64());
+    let timeout_ms = arguments
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10_000);
+
+    let provided = [
+        text.is_some(),
+        selector.is_some(),
+        url.is_some(),
+        network_idle_ms.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    if provided != 1 {
+        return Err(McpError::InvalidParams(
+            "browser_wait_for requires exactly one of: text, selector, url, network_idle_ms"
+                .to_string(),
+        ));
+    }
+    let condition = if let Some(t) = text {
+        WaitCondition::Text(t)
+    } else if let Some(s) = selector {
+        WaitCondition::Selector(s)
+    } else if let Some(u) = url {
+        WaitCondition::UrlContains(u)
+    } else {
+        WaitCondition::NetworkIdle {
+            quiet_ms: network_idle_ms.unwrap_or(200),
+        }
+    };
+
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    match session.wait_for(condition, timeout_ms).await {
+        Ok(tree) => Ok(ToolResult::text(tree)),
+        Err(e) => Ok(ToolResult::error(e.to_string())),
+    }
+}
+
+async fn call_console(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let action = arg_opt_string(arguments, "action").unwrap_or_else(|| "list".to_string());
+    let level = arg_opt_string(arguments, "level");
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    match action.as_str() {
+        "list" => {
+            let entries = session.console_entries(level.as_deref());
+            let json =
+                serde_json::to_string(&entries).map_err(|e| McpError::Internal(e.to_string()))?;
+            Ok(ToolResult::text(json))
+        }
+        "clear" => {
+            session.clear_console();
+            Ok(ToolResult::text("console cleared".to_string()))
+        }
+        other => Err(McpError::InvalidParams(format!(
+            "unknown console action '{other}' (expected list|clear)"
+        ))),
+    }
+}
+
+async fn call_network(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let action = arg_opt_string(arguments, "action").unwrap_or_else(|| "list".to_string());
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    match action.as_str() {
+        "list" => {
+            let failed_only = arg_bool(arguments, "failed_only");
+            let entries = session.network_entries(failed_only);
+            let json =
+                serde_json::to_string(&entries).map_err(|e| McpError::Internal(e.to_string()))?;
+            Ok(ToolResult::text(json))
+        }
+        "body" => {
+            let request_id = arg_string(arguments, "request_id")?;
+            match session.network_response_body(&request_id).await {
+                Ok(body) => Ok(ToolResult::text(body)),
+                Err(e) => Ok(ToolResult::error(e.to_string())),
+            }
+        }
+        "clear" => {
+            session.clear_network();
+            Ok(ToolResult::text("network log cleared".to_string()))
+        }
+        "set_headers" => {
+            let obj = arguments
+                .get("headers")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    McpError::InvalidParams("set_headers requires 'headers' object".to_string())
+                })?;
+            let mut map = std::collections::HashMap::with_capacity(obj.len());
+            for (k, v) in obj {
+                let s = v.as_str().ok_or_else(|| {
+                    McpError::InvalidParams(format!("header '{k}' value must be a string"))
+                })?;
+                if k.is_empty()
+                    || !k.is_ascii()
+                    || k.bytes().any(|b| b.is_ascii_control() || b == b':')
+                {
+                    return Err(McpError::InvalidParams(format!(
+                        "header name '{k}' must be non-empty ASCII without control characters or ':'"
+                    )));
+                }
+                if !s.is_ascii() || s.bytes().any(|b| b.is_ascii_control()) {
+                    return Err(McpError::InvalidParams(format!(
+                        "header '{k}' value must be ASCII without control characters"
+                    )));
+                }
+                map.insert(k.clone(), s.to_string());
+            }
+            match session.set_extra_headers(map).await {
+                Ok(()) => Ok(ToolResult::text("extra headers updated".to_string())),
+                Err(e) => Ok(ToolResult::error(e.to_string())),
+            }
+        }
+        other => Err(McpError::InvalidParams(format!(
+            "unknown network action '{other}' (expected list|body|clear|set_headers)"
+        ))),
+    }
+}
+
+async fn call_route(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let action = arg_opt_string(arguments, "action").unwrap_or_else(|| "list".to_string());
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    match action.as_str() {
+        "add" => {
+            let url_pattern = arg_string(arguments, "url_pattern")?;
+            if url_pattern.trim().is_empty() {
+                return Err(McpError::InvalidParams(
+                    "url_pattern must not be empty".to_string(),
+                ));
+            }
+            let status = match arguments.get("status") {
+                None => 200,
+                Some(v) => v
+                    .as_u64()
+                    .and_then(|n| u16::try_from(n).ok())
+                    .filter(|&code| (100..=599).contains(&code))
+                    .ok_or_else(|| {
+                        McpError::InvalidParams(
+                            "route 'status' must be an HTTP status integer in 100..=599"
+                                .to_string(),
+                        )
+                    })?,
+            };
+            let content_type = arg_opt_string(arguments, "content_type")
+                .unwrap_or_else(|| "application/json".to_string());
+            let content_type = content_type.trim().to_string();
+            if content_type.is_empty()
+                || !content_type.is_ascii()
+                || content_type.bytes().any(|b| b.is_ascii_control())
+            {
+                return Err(McpError::InvalidParams(
+                    "route 'content_type' must be non-empty ASCII without control characters"
+                        .to_string(),
+                ));
+            }
+            let body = arg_opt_string(arguments, "body").unwrap_or_default();
+            let abort = arg_bool(arguments, "abort");
+            let rule = RouteRule {
+                url_pattern,
+                status,
+                content_type,
+                body,
+                abort,
+            };
+            match session.add_route(rule).await {
+                Ok(()) => Ok(ToolResult::text("route rule added".to_string())),
+                Err(e) => Ok(ToolResult::error(e.to_string())),
+            }
+        }
+        "list" => {
+            let rules = session.list_routes();
+            let json =
+                serde_json::to_string(&rules).map_err(|e| McpError::Internal(e.to_string()))?;
+            Ok(ToolResult::text(json))
+        }
+        "clear" => match session.clear_routes().await {
+            Ok(()) => Ok(ToolResult::text("routes cleared".to_string())),
+            Err(e) => Ok(ToolResult::error(e.to_string())),
+        },
+        other => Err(McpError::InvalidParams(format!(
+            "unknown route action '{other}' (expected add|list|clear)"
+        ))),
+    }
+}
+
+async fn call_contexts(
+    arguments: &Value,
+    handle: &SessionHandle,
+    default_config: &SessionConfig,
+) -> Result<ToolResult, McpError> {
+    let action = arg_opt_string(arguments, "action").unwrap_or_else(|| "list".to_string());
+    match action.as_str() {
+        "list" => {
+            let guard = handle.lock().await;
+            let mut items: Vec<Value> = guard
+                .sessions
+                .iter()
+                .map(|(name, sess)| {
+                    serde_json::json!({
+                        "name": name,
+                        "active": name == guard.active_name(),
+                        "url": sess.current_url(),
+                        "browser_context_id": sess.browser_context_id(),
+                    })
+                })
+                .collect();
+            items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            let json =
+                serde_json::to_string(&items).map_err(|e| McpError::Internal(e.to_string()))?;
+            Ok(ToolResult::text(json))
+        }
+        "create" => {
+            let name = arg_string(arguments, "name")?;
+            if name.trim().is_empty() || name == "default" {
+                return Err(McpError::InvalidParams(
+                    "context name must be non-empty and not 'default'".to_string(),
+                ));
+            }
+            let mut guard = handle.lock().await;
+            if guard.sessions.contains_key(&name) {
+                return Ok(ToolResult::error(format!(
+                    "browser context '{name}' already exists"
+                )));
+            }
+            if !guard.sessions.contains_key("default") {
+                let fresh = BrowserSession::launch(default_config.clone())
+                    .await
+                    .map_err(|e| McpError::Internal(e.to_string()))?;
+                guard.sessions.insert("default".to_string(), fresh);
+            }
+            let Some(default_sess) = guard.sessions.get("default") else {
+                return Err(McpError::Internal(
+                    "default browser session was not created".to_string(),
+                ));
+            };
+            let sess = default_sess
+                .create_isolated_context(default_config)
+                .await
+                .map_err(|e| McpError::Internal(e.to_string()))?;
+            guard.sessions.insert(name.clone(), sess);
+            guard.active = name.clone();
+            Ok(ToolResult::text(format!(
+                "created and selected browser context '{name}'"
+            )))
+        }
+        "select" => {
+            let name = arg_string(arguments, "name")?;
+            let mut guard = handle.lock().await;
+            if !guard.sessions.contains_key(&name) {
+                return Ok(ToolResult::error(format!(
+                    "unknown browser context '{name}'"
+                )));
+            }
+            guard.active = name.clone();
+            let tree = guard
+                .sessions
+                .get(&name)
+                .map(|s| s.last_tree().to_string())
+                .unwrap_or_default();
+            Ok(ToolResult::text(if tree.is_empty() {
+                format!("selected browser context '{name}'")
+            } else {
+                tree
+            }))
+        }
+        "close" => {
+            let name = arg_string(arguments, "name")?;
+            if name == "default" {
+                return Ok(ToolResult::error(
+                    "cannot close the 'default' browser context".to_string(),
+                ));
+            }
+            let mut guard = handle.lock().await;
+            let Some(sess) = guard.sessions.remove(&name) else {
+                return Ok(ToolResult::error(format!(
+                    "unknown browser context '{name}'"
+                )));
+            };
+            if guard.active == name {
+                guard.active = "default".to_string();
+            }
+            if let Err(error) = sess.close_isolated_context().await {
+                return Ok(ToolResult::error(format!(
+                    "failed to close browser context '{name}': {error}"
+                )));
+            }
+            Ok(ToolResult::text(format!("closed browser context '{name}'")))
+        }
+        other => Err(McpError::InvalidParams(format!(
+            "unknown contexts action '{other}' (expected list|create|select|close)"
+        ))),
+    }
+}
+
+async fn call_emulate(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    let viewport = if let Some(vp) = arguments.get("viewport").and_then(Value::as_object) {
+        let width = vp
+            .get("width")
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+            .filter(|&w| (1..=16_384).contains(&w))
+            .ok_or_else(|| {
+                McpError::InvalidParams("viewport.width must be an integer in 1..=16384".into())
+            })?;
+        let height = vp
+            .get("height")
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+            .filter(|&h| (1..=16_384).contains(&h))
+            .ok_or_else(|| {
+                McpError::InvalidParams("viewport.height must be an integer in 1..=16384".into())
+            })?;
+        let device_scale_factor = vp
+            .get("device_scale_factor")
+            .and_then(Value::as_f64)
+            .unwrap_or(1.0);
+        if !device_scale_factor.is_finite()
+            || device_scale_factor <= 0.0
+            || device_scale_factor > 10.0
+        {
+            return Err(McpError::InvalidParams(
+                "viewport.device_scale_factor must be in (0, 10]".into(),
+            ));
+        }
+        let mobile = vp.get("mobile").and_then(Value::as_bool).unwrap_or(false);
+        Some(ViewportOptions {
+            width,
+            height,
+            device_scale_factor,
+            mobile,
+        })
+    } else {
+        None
+    };
+    let geolocation = if let Some(g) = arguments.get("geolocation").and_then(Value::as_object) {
+        let latitude = g
+            .get("latitude")
+            .and_then(Value::as_f64)
+            .filter(|&lat| lat.is_finite() && (-90.0..=90.0).contains(&lat))
+            .ok_or_else(|| {
+                McpError::InvalidParams("geolocation.latitude must be in -90..=90".into())
+            })?;
+        let longitude = g
+            .get("longitude")
+            .and_then(Value::as_f64)
+            .filter(|&lon| lon.is_finite() && (-180.0..=180.0).contains(&lon))
+            .ok_or_else(|| {
+                McpError::InvalidParams("geolocation.longitude must be in -180..=180".into())
+            })?;
+        let accuracy = g.get("accuracy").and_then(Value::as_f64).unwrap_or(10.0);
+        if !accuracy.is_finite() || accuracy < 0.0 {
+            return Err(McpError::InvalidParams(
+                "geolocation.accuracy must be a non-negative finite number".into(),
+            ));
+        }
+        Some(GeolocationOptions {
+            latitude,
+            longitude,
+            accuracy,
+        })
+    } else {
+        None
+    };
+    let opts = EmulationOptions {
+        viewport,
+        timezone: arg_opt_string(arguments, "timezone"),
+        locale: arg_opt_string(arguments, "locale"),
+        geolocation,
+    };
+    let permissions = if let Some(perms) = arguments.get("permissions").and_then(Value::as_object) {
+        let origin = perms
+            .get("origin")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let raw_grants = perms
+            .get("grants")
+            .and_then(Value::as_array)
+            .ok_or_else(|| McpError::InvalidParams("permissions.grants must be an array".into()))?;
+        let mut grants = Vec::with_capacity(raw_grants.len());
+        for entry in raw_grants {
+            let perm = entry.as_str().ok_or_else(|| {
+                McpError::InvalidParams("each permissions.grants entry must be a string".into())
+            })?;
+            grants.push(perm.to_string());
+        }
+        Some((origin, grants))
+    } else {
+        None
+    };
+    if arg_bool(arguments, "reset") {
+        if let Err(e) = session.reset_emulation().await {
+            return Ok(ToolResult::error(e.to_string()));
+        }
+    }
+    if let Err(e) = session.emulate(opts).await {
+        return Ok(ToolResult::error(e.to_string()));
+    }
+    if let Some((origin, grants)) = permissions {
+        if let Err(e) = session.grant_permissions(origin.as_deref(), &grants).await {
+            return Ok(ToolResult::error(e.to_string()));
+        }
+    }
+    Ok(ToolResult::text("emulation updated".to_string()))
+}
+
+fn is_windows_reserved_stem(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+async fn call_pdf(
+    arguments: &Value,
+    handle: &SessionHandle,
+    default_config: &SessionConfig,
+) -> Result<ToolResult, McpError> {
+    let name = arg_string(arguments, "name")?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || is_windows_reserved_stem(&name)
+    {
+        return Err(McpError::InvalidParams(
+            "pdf 'name' must use only letters, digits, '-' or '_' and not be a reserved device name"
+                .to_string(),
+        ));
+    }
+    let root = mcp_file_root(default_config)?;
+    let pdf_dir = root.join("pdfs");
+    tokio::fs::create_dir_all(&pdf_dir)
+        .await
+        .map_err(|e| McpError::Internal(format!("cannot create pdf directory: {e}")))?;
+    let pdf_dir = tokio::fs::canonicalize(&pdf_dir)
+        .await
+        .map_err(|e| McpError::Internal(format!("cannot resolve pdf directory: {e}")))?;
+    if !pdf_dir.starts_with(&root) {
+        return Err(McpError::InvalidParams(
+            "pdf directory resolves outside the configured root".to_string(),
+        ));
+    }
+    let path = pdf_dir.join(format!("{name}.pdf"));
+
+    let scale = arguments
+        .get("scale")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    if !scale.is_finite() || !(0.1..=2.0).contains(&scale) {
+        return Err(McpError::InvalidParams(
+            "pdf 'scale' must be a number in 0.1..=2.0".to_string(),
+        ));
+    }
+    let opts = PdfOptions {
+        landscape: arg_bool(arguments, "landscape"),
+        print_background: arguments
+            .get("print_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        scale,
+    };
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    match session.print_to_pdf(opts).await {
+        Ok(bytes) => {
+            // Write to a new file and replace the destination atomically.
+            // Renaming replaces a destination symlink instead of following it.
+            let size = bytes.len();
+            let result = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                use std::io::Write;
+                let mut temp = tempfile::NamedTempFile::new_in(pdf_dir)?;
+                temp.write_all(&bytes)?;
+                temp.persist(&path).map_err(|error| error.error)?;
+                Ok(path)
+            })
+            .await
+            .map_err(|e| McpError::Internal(format!("pdf write task failed: {e}")))?;
+            let path = result.map_err(|e| McpError::Internal(format!("cannot write pdf: {e}")))?;
+            let resp = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "bytes": size,
+            });
+            Ok(ToolResult::text(resp.to_string()))
+        }
+        Err(e) => Ok(ToolResult::error(e.to_string())),
+    }
 }
 
 /// Append one MCP tool call to the metrics trail.
@@ -382,24 +1270,21 @@ async fn call_open(
     let policy = arg_resource_policy(arguments, default_config)?;
     let mut guard = ensure_session(handle, default_config, policy).await?;
     let session = require_session(&mut guard)?;
+    let mut cfg = default_config.clone();
+    cfg.resource_policy = session.resource_policy();
+    let existing_tabs = match session.recover_closed_active_tab(&cfg).await {
+        Ok(tabs) => tabs,
+        Err(error) => return Ok(ToolResult::error(error.to_string())),
+    };
     let opener = session.target_id().to_string();
-    let existing: std::collections::HashSet<String> = session
-        .list_tabs()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| t.target_id)
-        .collect();
+    let existing: std::collections::HashSet<String> =
+        existing_tabs.into_iter().map(|t| t.target_id).collect();
     match session.open(&url).await {
-        Ok(tree) => {
-            let mut cfg = default_config.clone();
-            cfg.resource_policy = session.resource_policy();
-            match focus_new_popup(session, &opener, &existing, &cfg).await {
-                Ok(Some(popup_tree)) => Ok(ToolResult::text(popup_tree)),
-                Ok(None) => Ok(ToolResult::text(tree)),
-                Err(e) => Ok(ToolResult::error(e.to_string())),
-            }
-        }
+        Ok(tree) => match focus_new_popup(session, &opener, &existing, &cfg).await {
+            Ok(Some(popup_tree)) => Ok(ToolResult::text(popup_tree)),
+            Ok(None) => Ok(ToolResult::text(tree)),
+            Err(e) => Ok(ToolResult::error(e.to_string())),
+        },
         Err(e) => Ok(ToolResult::error(e.to_string())),
     }
 }
@@ -437,6 +1322,10 @@ async fn call_tabs(
     let session = require_session(&mut guard)?;
     let mut config = default_config.clone();
     config.resource_policy = session.resource_policy();
+    session
+        .recover_closed_active_tab(&config)
+        .await
+        .map_err(|error| McpError::Internal(error.to_string()))?;
     match action.as_str() {
         "list" => {
             let active = session.target_id().to_string();
@@ -492,9 +1381,11 @@ fn storage_state_path(config: &SessionConfig, name: &str) -> Result<std::path::P
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         || name.ends_with(".json")
+        || is_windows_reserved_stem(name)
     {
         return Err(McpError::InvalidParams(
-            "name must be a simple file name without a path or extension".into(),
+            "name must be a simple file name without a path or extension and not a reserved device name"
+                .into(),
         ));
     }
     let root = config
@@ -636,7 +1527,10 @@ async fn call_downloads(arguments: &Value, handle: &SessionHandle) -> Result<Too
             .and_then(Value::as_u64)
             .unwrap_or(10_000)
             .clamp(100, 20_000);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let now = tokio::time::Instant::now();
+        let deadline = now
+            .checked_add(std::time::Duration::from_millis(timeout_ms))
+            .unwrap_or(now);
         loop {
             if let Some(download) = session
                 .downloads()
@@ -690,7 +1584,11 @@ async fn call_fill_form(arguments: &Value, handle: &SessionHandle) -> Result<Too
             "no browser session: call browser_open first".to_string(),
         ));
     }
-    let session = guard.as_mut().expect("session present");
+    let Some(session) = guard.as_mut() else {
+        return Ok(ToolResult::error(
+            "no browser session: call browser_open first".to_string(),
+        ));
+    };
     match session.fill_form(&fields).await {
         Ok(outcome) => match outcome.failed {
             None => Ok(ToolResult::text(outcome.tree)),
@@ -708,8 +1606,25 @@ async fn call_act(
     handle: &SessionHandle,
     default_config: &SessionConfig,
 ) -> Result<ToolResult, McpError> {
-    let action_id = arg_u32(arguments, "action_id")?;
     let action = arg_string(arguments, "action")?;
+    let action_id_opt = if arguments.get("action_id").is_some() {
+        Some(arg_u32(arguments, "action_id")?)
+    } else {
+        None
+    };
+    let require_action_id = || {
+        action_id_opt
+            .ok_or_else(|| McpError::InvalidParams("missing required 'action_id'".to_string()))
+    };
+    if matches!(
+        action.as_str(),
+        "click" | "double_click" | "right_click" | "drag_and_drop" | "fill" | "hover" | "select"
+    ) {
+        require_action_id()?;
+    }
+    if action == "drag_and_drop" {
+        arg_u32(arguments, "target_action_id")?;
+    }
     let value = arg_opt_string(arguments, "value").unwrap_or_default();
 
     let mut guard = handle.lock().await;
@@ -723,7 +1638,11 @@ async fn call_act(
     }
     // Touch default_config so the launch path stays explicit for future use.
     let _ = default_config;
-    let session = guard.as_mut().expect("session present");
+    let Some(session) = guard.as_mut() else {
+        return Ok(ToolResult::error(
+            "no browser session: call browser_open first".to_string(),
+        ));
+    };
     let opener = session.target_id().to_string();
     let existing: std::collections::HashSet<String> = session
         .list_tabs()
@@ -748,6 +1667,22 @@ async fn call_act(
             "select requires 'value' (option text or value)".to_string(),
         ));
     }
+    if action == "scroll" {
+        if !value.is_empty() && ScrollDirection::parse(&value).is_none() {
+            return Ok(ToolResult::error(format!(
+                "invalid scroll direction '{value}' (expected up|down|left|right)"
+            )));
+        }
+        let amount = arguments
+            .get("amount")
+            .and_then(Value::as_f64)
+            .unwrap_or(300.0);
+        if !amount.is_finite() || amount < 0.0 {
+            return Ok(ToolResult::error(
+                "scroll 'amount' must be a non-negative finite number".to_string(),
+            ));
+        }
+    }
     let prompt_text = arg_opt_string(arguments, "prompt_text");
     if let Some(dialog_action) = arg_opt_string(arguments, "dialog_action") {
         match dialog_action.as_str() {
@@ -771,33 +1706,29 @@ async fn call_act(
     }
 
     let result = match action.as_str() {
-        "click" => session.click(action_id).await,
-        "fill" => session.fill(action_id, &value).await,
-        "hover" => session.hover(action_id).await,
+        "click" => session.click(require_action_id()?).await,
+        "double_click" => session.double_click(require_action_id()?).await,
+        "right_click" => session.right_click(require_action_id()?).await,
+        "drag_and_drop" => {
+            let src = require_action_id()?;
+            let dst = arg_u32(arguments, "target_action_id")?;
+            session.drag_and_drop(src, dst).await
+        }
+        "fill" => session.fill(require_action_id()?, &value).await,
+        "hover" => session.hover(require_action_id()?).await,
         "press_key" => session.press_key(&value).await,
-        "select" => session.select(action_id, &value).await,
+        "select" => session.select(require_action_id()?, &value).await,
         "scroll" => {
-            let direction = if value.is_empty() {
-                ScrollDirection::Down
-            } else {
-                match ScrollDirection::parse(&value) {
-                    Some(d) => d,
-                    None => {
-                        return Ok(ToolResult::error(format!(
-                            "invalid scroll direction '{value}' (expected up|down|left|right)"
-                        )))
-                    }
-                }
-            };
+            let direction = ScrollDirection::parse(&value).unwrap_or(ScrollDirection::Down);
             let amount = arguments
                 .get("amount")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(300.0);
-            session.scroll(direction, amount).await
+            session.scroll_at(action_id_opt, direction, amount).await
         }
         other => {
             return Ok(ToolResult::error(format!(
-                "unknown action '{other}' (expected click|fill|hover|press_key|scroll|select)"
+                "unknown action '{other}' (expected click|double_click|right_click|drag_and_drop|fill|hover|press_key|scroll|select)"
             )))
         }
     };
@@ -870,6 +1801,11 @@ async fn call_screenshot(
     arguments: &Value,
     handle: &SessionHandle,
 ) -> Result<ToolResult, McpError> {
+    let action_id = if arguments.get("action_id").is_some() {
+        Some(arg_u32(arguments, "action_id")?)
+    } else {
+        None
+    };
     let opts = ScreenshotOptions {
         full_page: arg_bool(arguments, "full_page"),
         prepare_lazy_content: arguments
@@ -877,6 +1813,7 @@ async fn call_screenshot(
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
         timeout_ms: arg_u64(arguments, "timeout_ms", SCREENSHOT_PREPARE_MS_DEFAULT),
+        action_id,
     };
     let guard = handle.lock().await;
     match guard.as_ref() {
@@ -893,6 +1830,86 @@ async fn call_screenshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_tool_arguments_are_rejected_before_execution() {
+        for (name, value) in [
+            (
+                "browser_open",
+                serde_json::json!({"url":"https://example.com", "text_only":"yes"}),
+            ),
+            (
+                "browser_fill_form",
+                serde_json::json!({"fields":[{"action_id":1,"value":7}]}),
+            ),
+            (
+                "browser_emulate",
+                serde_json::json!({"reset":true,"viewport":{"width":1}}),
+            ),
+            (
+                "browser_network",
+                serde_json::json!({"action":"set_headers","headers":{"X-Test":false}}),
+            ),
+            (
+                "browser_screenshot",
+                serde_json::json!({"timeout_ms": "slow"}),
+            ),
+            ("browser_screenshot", serde_json::json!({"timeout_ms": -1})),
+            (
+                "browser_act",
+                serde_json::json!({"action": "click", "action_id": 4294967296u64}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate_tool_arguments(name, &value),
+                    Err(McpError::InvalidParams(_))
+                ),
+                "{name}: {value}"
+            );
+        }
+        assert!(validate_tool_arguments(
+            "browser_open",
+            &serde_json::json!({"url":"https://example.com"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn each_declared_tool_property_rejects_a_wrong_type() {
+        for definition in tool_definitions() {
+            let name = definition["name"].as_str().unwrap();
+            let Some(properties) = definition["inputSchema"]["properties"].as_object() else {
+                continue;
+            };
+            for (key, schema) in properties {
+                let kind = schema["type"].as_str().unwrap();
+                let bad_value = if kind == "string" {
+                    serde_json::json!(false)
+                } else {
+                    serde_json::json!("wrong type")
+                };
+                assert!(
+                    validate_value(schema, &bad_value, key).is_err(),
+                    "{name}.{key} accepted {bad_value}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_arguments_do_not_create_browser_session() {
+        let handle: SessionHandle = Arc::new(Mutex::new(SessionManager::new()));
+        let result = call_tool(
+            "browser_open",
+            &serde_json::json!({"url": "https://example.com", "text_only": "yes"}),
+            &handle,
+            &SessionConfig::default(),
+        )
+        .await;
+        assert!(matches!(result, Err(McpError::InvalidParams(_))));
+        assert!(handle.lock().await.is_none());
+    }
 
     #[test]
     fn bare_host_is_resolved_then_allowed() {
@@ -945,7 +1962,28 @@ mod tests {
         };
         assert!(storage_state_path(&config, "../outside").is_err());
         assert!(storage_state_path(&config, "nested/name").is_err());
+        assert!(storage_state_path(&config, "CON").is_err());
+        assert!(storage_state_path(&config, "nul").is_err());
+        assert!(storage_state_path(&config, "com1").is_err());
         assert!(storage_state_path(&config, "valid-state").is_ok());
+    }
+
+    #[test]
+    fn windows_reserved_stems_are_rejected_case_insensitively() {
+        for reserved in [
+            "CON", "con", "PRN", "aux", "NUL", "com1", "COM9", "LPT1", "lpt9", "CON.pdf",
+        ] {
+            assert!(
+                is_windows_reserved_stem(reserved),
+                "{reserved} must be rejected"
+            );
+        }
+        for allowed in ["report", "conifer", "com10", "lpt0", "nul_file"] {
+            assert!(
+                !is_windows_reserved_stem(allowed),
+                "{allowed} must be allowed"
+            );
+        }
     }
 
     #[test]

@@ -667,3 +667,73 @@ async fn nested_tree_default_open_shadow_root_and_clickable_div() {
 
     session.shutdown().await;
 }
+
+#[tokio::test]
+async fn framework_add_event_listener_and_react_onclick_detection() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+    let mut session =
+        flashbrowse_core::BrowserSession::launch(flashbrowse_core::SessionConfig::default())
+            .await
+            .expect("launch Chrome");
+    let html = r#"<!doctype html><html><body>
+<div id="vue-div" style="cursor:pointer">Listener Div</div>
+<div id="react-div">React Div</div>
+<div id="fake-pointer" style="cursor:pointer">Not Clickable</div>
+<div id="wrap" style="cursor:pointer"><button id="real-btn">Real Btn</button></div>
+<script>
+const vueDiv = document.getElementById('vue-div');
+vueDiv.addEventListener('click', () => { vueDiv.textContent = 'Listener Fired'; });
+const reactDiv = document.getElementById('react-div');
+reactDiv.__reactProps$test = { onClick: () => {} };
+document.body.addEventListener('click', (e) => {
+  if (e.target === reactDiv) reactDiv.textContent = 'React Fired';
+});
+document.getElementById('wrap').addEventListener('click', () => {});
+</script></body></html>"#;
+    let url = format!("data:text/html,{}", html.replace('\n', ""));
+    let tree = session.open(&url).await.expect("open");
+    let body = tree.split("---\n").nth(1).unwrap_or(&tree);
+
+    let find_id = |needle: &str| -> Option<u32> {
+        body.lines()
+            .find(|l| l.contains(needle))
+            .and_then(|l| l.trim_start().strip_prefix('['))
+            .and_then(|r| r.split(']').next())
+            .and_then(|n| n.parse().ok())
+    };
+
+    let vue_id = find_id("Listener Div").expect("addEventListener div must get an action_id");
+    let react_id = find_id("React Div").expect("React __reactProps$ div must get an action_id");
+    assert!(
+        find_id("Not Clickable").is_none(),
+        "cursor:pointer without listener must not get an action_id:\n{body}"
+    );
+    assert!(
+        find_id("Real Btn").is_some(),
+        "Real Btn must stay actionable"
+    );
+    assert_eq!(
+        body.matches("Real Btn").count(),
+        1,
+        "wrapper around button must not duplicate button:\n{body}"
+    );
+
+    let after_vue = session.click(vue_id).await.expect("click listener div");
+    assert!(after_vue.contains("Listener Fired"), "{after_vue}");
+
+    let body2 = after_vue.split("---\n").nth(1).unwrap_or(&after_vue);
+    let react_id2 = body2
+        .lines()
+        .find(|l| l.contains("React Div"))
+        .and_then(|l| l.trim_start().strip_prefix('['))
+        .and_then(|r| r.split(']').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(react_id);
+    let after_react = session.click(react_id2).await.expect("click react div");
+    assert!(after_react.contains("React Fired"), "{after_react}");
+
+    session.shutdown().await;
+}

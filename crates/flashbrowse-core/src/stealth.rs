@@ -142,11 +142,9 @@ fn extract_chrome_version(ua: &str) -> Option<&str> {
 }
 
 fn rewrite_ua_os(ua: &str, target_os: &str) -> String {
-    if let Some(open) = ua.find("Mozilla/5.0 (") {
-        let start = open + "Mozilla/5.0 (".len();
-        if let Some(rel_close) = ua[start..].find(')') {
-            let end = start + rel_close;
-            return format!("{}{}{}", &ua[..start], target_os, &ua[end..]);
+    if let Some((prefix, suffix)) = ua.split_once("Mozilla/5.0 (") {
+        if let Some((_, tail)) = suffix.split_once(')') {
+            return format!("{prefix}Mozilla/5.0 ({target_os}){tail}");
         }
     }
     ua.to_string()

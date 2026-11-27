@@ -1,6 +1,5 @@
 //! Regression test for GitHub issue #1:
 //! `open --session-id <id>` must keep Chromium alive after the CLI exits
-//! (even on Linux where `PR_SET_PDEATHSIG` is used for ephemeral runs).
 
 use std::process::Command;
 
@@ -68,4 +67,49 @@ fn persistent_session_survives_cli_exit_and_accepts_act() {
         "close failed: stderr={}",
         String::from_utf8_lossy(&close.stderr)
     );
+}
+
+#[test]
+fn closing_persistent_session_preserves_caller_profile_in_temp() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        return;
+    }
+    let bin = env!("CARGO_BIN_EXE_flashbrowse");
+    let id = format!("test-profile-{}", std::process::id());
+    let root =
+        std::env::temp_dir().join(format!("flashbrowse-profile-test-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let marker = root.join("caller-data");
+    std::fs::write(&marker, b"preserve").unwrap();
+    let _guard = SessionGuard {
+        bin,
+        id: id.clone(),
+    };
+    let open = Command::new(bin)
+        .args([
+            "open",
+            "data:text/html,<h1>Profile</h1>",
+            "--session-id",
+            &id,
+            "--user-data-dir",
+        ])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        open.status.success(),
+        "{}",
+        String::from_utf8_lossy(&open.stderr)
+    );
+    let close = Command::new(bin)
+        .args(["close", "--session-id", &id])
+        .output()
+        .unwrap();
+    assert!(
+        close.status.success(),
+        "{}",
+        String::from_utf8_lossy(&close.stderr)
+    );
+    assert_eq!(std::fs::read(&marker).unwrap(), b"preserve");
+    std::fs::remove_dir_all(root).unwrap();
 }

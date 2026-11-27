@@ -71,14 +71,14 @@ pub async fn run(
         }
     };
 
-    println!(
+    crate::write_stdout(format_args!(
         "{:<38} {:>10} {:>12} {:>10} {:>10}",
         "URL", "Raw HTML", "AXTree", "Latency", "RSS"
-    );
-    println!(
+    ))?;
+    crate::write_stdout(format_args!(
         "{:-<38} {:-<10} {:-<12} {:-<10} {:-<10}",
         "", "", "", "", ""
-    );
+    ))?;
 
     let mut any_fail = false;
     let mut last_settle = None;
@@ -86,7 +86,7 @@ pub async fn run(
         match bench_one(url, chrome_path.clone(), resource_policy, stealth_profile).await {
             Ok(row) => {
                 last_settle = row.settle.clone();
-                println!(
+                crate::write_stdout(format_args!(
                     "{:<38} {:>8}t {:>10}t {:>8}ms {:>7}{}",
                     trim_url(url),
                     row.raw_tokens,
@@ -102,17 +102,20 @@ pub async fn run(
                         )
                     } else {
                         String::new()
-                    }
-                );
-                println!("{:<38} browser startup {}ms", "", row.startup_ms);
+                    },
+                ))?;
+                crate::write_stdout(format_args!(
+                    "{:<38} browser startup {}ms",
+                    "", row.startup_ms
+                ))?;
             }
             Err(e) => {
                 any_fail = true;
-                println!("{:<38} FAIL: {e}", trim_url(url));
+                crate::write_stdout(format_args!("{:<38} FAIL: {e}", trim_url(url)))?;
             }
         }
         if let Some(s) = last_settle.take() {
-            println!(
+            crate::write_stdout(format_args!(
                 "{:<38} settle nav {}ms poll {}ms sleep {}ms ax {}ms/{} compress {}ms title {}ms render {}ms iters {} ({})",
                 "",
                 s.nav_ms,
@@ -125,7 +128,7 @@ pub async fn run(
                 s.render_ms,
                 s.iterations,
                 s.exit_reason
-            );
+            ))?;
         }
     }
     let joined = targets.join(",");

@@ -3,6 +3,29 @@
 
 use flashbrowse_core::{actions::ScrollDirection, BrowserSession, SessionConfig};
 
+#[test]
+fn browser_operations_work_without_caller_runtime_drivers() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut session = BrowserSession::launch(SessionConfig::default())
+            .await
+            .unwrap();
+        let tree = session
+            .open("data:text/html,<button onclick=\"this.textContent='Done'\">Go</button>")
+            .await
+            .unwrap();
+        assert!(tree.contains("Go"));
+        assert!(session.click(1).await.unwrap().contains("Done"));
+        assert!(!session.screenshot_viewport().await.unwrap().is_empty());
+        session.shutdown().await;
+    });
+}
+
 #[tokio::test]
 async fn test_open_click_fill_scroll() {
     if flashbrowse_cdp::find_chrome(None).is_err() {
@@ -53,6 +76,11 @@ async fn test_open_click_fill_scroll() {
     // Markdown extraction returns non-empty document text.
     let md = session.extract_markdown().await.expect("markdown");
     assert!(!md.is_empty(), "markdown should be non-empty");
+    let error = session
+        .evaluate("(() => { throw new Error('evaluation failed') })()")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("evaluation failed"));
 
     session.shutdown().await;
 }

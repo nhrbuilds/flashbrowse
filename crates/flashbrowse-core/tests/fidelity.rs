@@ -33,47 +33,54 @@ use flashbrowse_core::{BrowserSession, SessionConfig};
 /// Serve `tests/fixtures/*` on a throwaway port. One connection at a time is
 /// enough: the browser only fetches the page and a favicon.
 fn spawn_static_server() -> (u16, Arc<std::thread::JoinHandle<()>>) {
+    use std::net::Shutdown;
+    use std::time::Duration;
+
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let handle = std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut reader = BufReader::new(match stream.try_clone() {
-                Ok(s) => s,
-                Err(_) => continue,
+            let Ok(stream) = stream else { continue };
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = String::new();
+                if let Ok(cloned) = stream.try_clone() {
+                    let mut reader = BufReader::new(cloned);
+                    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        line.clear();
+                    }
+                }
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let file = path.trim_start_matches('/');
+                let file = if file.is_empty() { "index.html" } else { file };
+                match std::fs::read(dir.join(file)) {
+                    Ok(body) => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(&body);
+                    }
+                    Err(_) => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
             });
-            let mut request = String::new();
-            let _ = reader.read_line(&mut request);
-            // Drain the request head.
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    break;
-                }
-                if line == "\r\n" || line == "\n" {
-                    break;
-                }
-            }
-            let path = request.split_whitespace().nth(1).unwrap_or("/");
-            let file = path.trim_start_matches('/');
-            let file = if file.is_empty() { "index.html" } else { file };
-            match std::fs::read(dir.join(file)) {
-                Ok(body) => {
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&body);
-                }
-                Err(_) => {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
-                }
-            }
-            let _ = stream.flush();
         }
     });
     (port, Arc::new(handle))

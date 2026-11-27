@@ -177,8 +177,13 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     let dir = managed_chrome_dir();
     if !force {
         if let Some(bin) = find_managed_binary() {
-            println!("managed Chrome already installed at {}", bin.display());
-            println!("(run 'flashbrowse setup --force' to reinstall)");
+            crate::write_stdout(format_args!(
+                "managed Chrome already installed at {}",
+                bin.display()
+            ))?;
+            crate::write_stdout(format_args!(
+                "(run 'flashbrowse setup --force' to reinstall)"
+            ))?;
             flashbrowse_core::observability::record_op(
                 "setup", "cached", started, None, true, None,
             );
@@ -189,12 +194,12 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("flashbrowse-setup/0.1")
         .build()?;
-    eprintln!(
+    crate::write_stderr(format_args!(
         "resolving Chrome-for-Testing stable ({} ...)...",
         platform_key()
-    );
+    ));
     let (url, version) = resolve_download(&client).await?;
-    eprintln!("chrome-headless-shell {version} <- {url}");
+    crate::write_stderr(format_args!("chrome-headless-shell {version} <- {url}"));
 
     // Download zip streaming to a unique temp file (symlink-safe: O_EXCL
     // semantics via create_new, and a per-pid name so concurrent runs
@@ -223,16 +228,16 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
             let chunk = chunk?;
             use std::io::Write;
             file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
+            downloaded = downloaded.saturating_add(chunk.len() as u64);
             if total > 0 {
-                eprint!(
+                crate::write_stderr_raw(format_args!(
                     "\r  downloaded {:.1} / {:.1} MB",
                     downloaded as f64 / (1024.0 * 1024.0),
                     total as f64 / (1024.0 * 1024.0)
-                );
+                ));
             }
         }
-        eprintln!();
+        crate::write_stderr(format_args!(""));
         Ok::<(), anyhow::Error>(())
     }
     .await;
@@ -251,18 +256,23 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     zip.extract(&extract_tmp)?;
     // Flatten single top-level dir if present (chrome-linux64/ → .)
     let mut staged: Vec<PathBuf> = vec![];
-    for entry in std::fs::read_dir(&extract_tmp)?.flatten() {
+    for entry in std::fs::read_dir(&extract_tmp)? {
+        let entry = entry?;
         staged.push(entry.path());
     }
-    if staged.len() == 1 && staged[0].is_dir() {
-        for entry in std::fs::read_dir(&staged[0])?.flatten() {
-            let dst = extract_tmp.join(entry.file_name());
-            std::fs::rename(entry.path(), &dst)?;
+    if let [single] = staged.as_slice() {
+        if single.is_dir() {
+            for entry in std::fs::read_dir(single)? {
+                let entry = entry?;
+                let dst = extract_tmp.join(entry.file_name());
+                std::fs::rename(entry.path(), &dst)?;
+            }
+            let _ = std::fs::remove_dir(single);
         }
-        let _ = std::fs::remove_dir(&staged[0]);
     }
     // Move staged contents into final dir (replace previous install).
-    for entry in std::fs::read_dir(&extract_tmp)?.flatten() {
+    for entry in std::fs::read_dir(&extract_tmp)? {
+        let entry = entry?;
         let dst = dir.join(entry.file_name());
         if dst.exists() {
             let _ = std::fs::remove_dir_all(&dst);
@@ -282,23 +292,26 @@ pub async fn run(force: bool) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
     }
     // Record version.
-    let _ = std::fs::write(dir.join("VERSION"), &version);
+    std::fs::write(dir.join("VERSION"), &version)?;
     // Verify it runs.
     let out = std::process::Command::new(&bin).arg("--version").output();
     match out {
         Ok(o) if o.status.success() => {
-            println!(
+            crate::write_stdout(format_args!(
                 "OK managed Chrome {} at {}",
                 String::from_utf8_lossy(&o.stdout).trim(),
                 bin.display()
-            );
+            ))?;
         }
-        _ => println!("installed at {} (verify manually)", bin.display()),
+        _ => crate::write_stdout(format_args!(
+            "installed at {} (verify manually)",
+            bin.display()
+        ))?,
     }
-    println!("try: flashbrowse open https://example.com");
+    crate::write_stdout(format_args!("try: flashbrowse open https://example.com"))?;
     flashbrowse_core::observability::record_op("setup", &version, started, None, true, None);
     Ok(())
 }

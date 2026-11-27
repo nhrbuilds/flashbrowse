@@ -89,6 +89,7 @@ jobs:
           path: ${{ runner.temp }}/doctor.json
 
       - run: cargo test --workspace -- --nocapture
+      - run: cargo test --release -p flashbrowse-cli --test mcp_malformed_smoke
 
   soak:
     name: soak (5 min, linux)

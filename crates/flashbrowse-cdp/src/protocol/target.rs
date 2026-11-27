@@ -12,6 +12,8 @@ pub struct CreateTargetParams {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headless: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_context_id: Option<String>,
 }
 
 /// Response of `Target.createTarget`.
@@ -42,6 +44,15 @@ pub async fn create_target(
     client: &CdpClient,
     url: &str,
 ) -> Result<CreateTargetResponse, CdpError> {
+    create_target_in_context(client, url, None).await
+}
+
+/// Create a new target (tab) at `url` inside an optional isolated `browserContextId`.
+pub async fn create_target_in_context(
+    client: &CdpClient,
+    url: &str,
+    browser_context_id: Option<&str>,
+) -> Result<CreateTargetResponse, CdpError> {
     client
         .send_typed(
             None,
@@ -49,9 +60,44 @@ pub async fn create_target(
             &CreateTargetParams {
                 url: url.to_string(),
                 headless: None,
+                browser_context_id: browser_context_id.map(str::to_string),
             },
         )
         .await
+}
+
+/// Create an isolated incognito-like context that lives for this CDP connection.
+pub async fn create_browser_context(client: &CdpClient) -> Result<String, CdpError> {
+    let resp: serde_json::Value = client
+        .send(
+            None,
+            "Target.createBrowserContext",
+            serde_json::json!({ "disposeOnDetach": true }),
+        )
+        .await?;
+    resp.get("browserContextId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| CdpError::ProtocolError {
+            method: "Target.createBrowserContext".to_string(),
+            code: -1,
+            message: "missing browserContextId".to_string(),
+        })
+}
+
+/// Dispose an isolated browser context (`Target.disposeBrowserContext`).
+pub async fn dispose_browser_context(
+    client: &CdpClient,
+    browser_context_id: &str,
+) -> Result<(), CdpError> {
+    let _: serde_json::Value = client
+        .send(
+            None,
+            "Target.disposeBrowserContext",
+            serde_json::json!({ "browserContextId": browser_context_id }),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Target metadata from `Target.getTargets`.
@@ -67,6 +113,8 @@ pub struct TargetInfo {
     pub title: String,
     #[serde(default)]
     pub opener_id: Option<String>,
+    #[serde(default)]
+    pub browser_context_id: Option<String>,
 }
 
 /// Response of `Target.getTargets`.

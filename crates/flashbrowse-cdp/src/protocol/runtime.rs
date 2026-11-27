@@ -6,6 +6,14 @@ use serde_json::Value;
 use crate::error::CdpError;
 use crate::transport::CdpClient;
 
+/// `Runtime.enable` - required for `Runtime.consoleAPICalled` and `Runtime.exceptionThrown`.
+pub async fn enable(client: &CdpClient, session_id: &str) -> Result<(), CdpError> {
+    let _: Value = client
+        .send(Some(session_id), "Runtime.enable", serde_json::json!({}))
+        .await?;
+    Ok(())
+}
+
 /// Params for `Runtime.evaluate`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,24 +89,65 @@ pub async fn evaluate(
 }
 
 /// `Runtime.callFunctionOn` - run a function against a resolved JS object.
-pub async fn call_function_on(
-    client: &CdpClient,
-    session_id: &str,
-    object_id: &str,
-    function_declaration: &str,
+pub fn call_function_on<'a>(
+    client: &'a CdpClient,
+    session_id: &'a str,
+    object_id: &'a str,
+    function_declaration: &'a str,
     args: Vec<Value>,
-) -> Result<CallFunctionOnResponse, CdpError> {
-    client
-        .send_typed(
-            Some(session_id),
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: function_declaration.to_string(),
-                object_id: object_id.to_string(),
-                arguments: Some(args),
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-        )
-        .await
+) -> impl std::future::Future<Output = Result<CallFunctionOnResponse, CdpError>> + 'a {
+    let args = if let Some(error) = args
+        .iter()
+        .find_map(|value| crate::transport::validate_json_depth(value).err())
+    {
+        for value in args {
+            crate::transport::drop_json_iteratively(value);
+        }
+        Err(error)
+    } else {
+        Ok(args)
+    };
+    async move {
+        client
+            .send_typed(
+                Some(session_id),
+                "Runtime.callFunctionOn",
+                &CallFunctionOnParams {
+                    function_declaration: function_declaration.to_string(),
+                    object_id: object_id.to_string(),
+                    arguments: Some(args?),
+                    return_by_value: Some(true),
+                    await_promise: Some(false),
+                },
+            )
+            .await
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[tokio::test]
+    async fn deeply_nested_function_arguments_are_rejected_and_dropped_safely() {
+        let (writer, _peer_reader) = tokio::io::duplex(128);
+        let (_peer_writer, reader) = tokio::io::duplex(128);
+        let client = crate::CdpClient::connect_pipe(reader, writer)
+            .await
+            .unwrap();
+        let value = (0..10_000).fold(serde_json::Value::Null, |value, _| {
+            serde_json::Value::Array(vec![value])
+        });
+        let result =
+            super::call_function_on(&client, "session", "object", "() => null", vec![value]).await;
+        assert!(result.is_err());
+        let value = (0..10_000).fold(serde_json::Value::Null, |value, _| {
+            serde_json::Value::Array(vec![value])
+        });
+        drop(super::call_function_on(
+            &client,
+            "session",
+            "object",
+            "() => null",
+            vec![value],
+        ));
+    }
 }

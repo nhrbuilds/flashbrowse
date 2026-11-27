@@ -1,0 +1,198 @@
+{
+  "generatedAt": "2026-11-27T04:43:21.622Z",
+  "binary": "/tmp/flashbrowse-size-target/release/flashbrowse",
+  "pages": [
+    {
+      "url": "http://127.0.0.1:8099/index.html",
+      "ok": true,
+      "ms": 811,
+      "staticTexts": 35,
+      "missing": [],
+      "rawBytes": 77127,
+      "treeBytes": 5272,
+      "treeSha256": "6e0bd50df6e420aef7918ca81730a4c376f04eedc61f122c3bf04b00499cdf36",
+      "reduction": 0.9316452085521283
+    },
+    {
+      "url": "http://127.0.0.1:8099/forms.html",
+      "ok": true,
+      "ms": 754,
+      "staticTexts": 7,
+      "missing": [],
+      "rawBytes": 18552,
+      "treeBytes": 858,
+      "treeSha256": "59dee6205dfc239ddd6c1ffe608c6b9eceb3d549a59bd5ec97d942ded3c6233d",
+      "reduction": 0.953751617076326
+    },
+    {
+      "url": "http://127.0.0.1:8099/table.html",
+      "ok": true,
+      "ms": 1140,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 123979,
+      "treeBytes": 2134,
+      "treeSha256": "0d9105d9c5e66bd5309adb491a52b6600ae05c69894241d90b01044135bd6439",
+      "reduction": 0.9827874075448262
+    },
+    {
+      "url": "http://127.0.0.1:8099/a11y.html",
+      "ok": true,
+      "ms": 837,
+      "staticTexts": 0,
+      "missing": [],
+      "rawBytes": 13846,
+      "treeBytes": 550,
+      "treeSha256": "ed71a824fb53e5de264b21249508849a948749f8477a3c1bee66bc7bf5b2fa16",
+      "reduction": 0.960277336414849
+    },
+    {
+      "url": "http://127.0.0.1:8099/unicode.html",
+      "ok": true,
+      "ms": 803,
+      "staticTexts": 3,
+      "missing": [],
+      "rawBytes": 6495,
+      "treeBytes": 644,
+      "treeSha256": "d684d3505f45b897368cb1a1c2e8221fb9be9cae407ecae39f378e4cab254cbd",
+      "reduction": 0.900846805234796
+    },
+    {
+      "url": "http://127.0.0.1:8099/shadow.html",
+      "ok": true,
+      "ms": 1668,
+      "staticTexts": 3,
+      "missing": [],
+      "rawBytes": 4941,
+      "treeBytes": 326,
+      "treeSha256": "f33253f779d524096a967c2aa3fbb385d5cde567f1ac878f2958d0496464ecb9",
+      "reduction": 0.9340214531471362
+    },
+    {
+      "url": "http://127.0.0.1:8099/frames.html",
+      "ok": true,
+      "ms": 1700,
+      "staticTexts": 3,
+      "missing": [],
+      "rawBytes": 5790,
+      "treeBytes": 332,
+      "treeSha256": "a80371d62633ba14f6e077f44c686642eb805babdbbb899d6b6962705035164a",
+      "reduction": 0.9426597582037997
+    },
+    {
+      "url": "http://127.0.0.1:8099/spatial.html",
+      "ok": true,
+      "ms": 753,
+      "staticTexts": 6,
+      "missing": [],
+      "rawBytes": 6882,
+      "treeBytes": 376,
+      "treeSha256": "8324de095646d82cc217294aff59d9f0c80880f6f61d2acd4edac1dbc4c35068",
+      "reduction": 0.945364719558268
+    },
+    {
+      "url": "http://127.0.0.1:8099/heavy-table.html",
+      "ok": true,
+      "ms": 885,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 458954,
+      "treeBytes": 6949,
+      "treeSha256": "ab1f50c75f68317334f828453c1b1bb6471044784429e8f3776b09aa166b9a26",
+      "reduction": 0.9848590490550251
+    },
+    {
+      "url": "http://127.0.0.1:8099/many-buttons.html",
+      "ok": true,
+      "ms": 803,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 51654,
+      "treeBytes": 1817,
+      "treeSha256": "ff74076e7f35a773ec778852e68663ed222ff1f4dae18ab5b7606a1a5a1928d0",
+      "reduction": 0.9648236341812831
+    },
+    {
+      "url": "http://127.0.0.1:8099/modal-dialog.html",
+      "ok": true,
+      "ms": 1772,
+      "staticTexts": 0,
+      "missing": [],
+      "rawBytes": 2428,
+      "treeBytes": 106,
+      "treeSha256": "1527e10afaa1a137bc1170b5ca6ed45daa9b087d2b4d38362a9df53ac43b2eda",
+      "reduction": 0.9563426688632619
+    },
+    {
+      "url": "http://127.0.0.1:8099/nested-depth.html",
+      "ok": true,
+      "ms": 1685,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 1612,
+      "treeBytes": 106,
+      "treeSha256": "39a64ede4244bfe9537f4ebeba646b45ad847afe2fccbbbb9af39ec0a9b8243b",
+      "reduction": 0.93424317617866
+    },
+    {
+      "url": "http://127.0.0.1:8099/contenteditable.html",
+      "ok": true,
+      "ms": 1654,
+      "staticTexts": 0,
+      "missing": [],
+      "rawBytes": 3661,
+      "treeBytes": 143,
+      "treeSha256": "f81b202a5ed376f8899f8344454514ecca9dc1623b8ffa1f1a2ac2c8adae6fae",
+      "reduction": 0.960939633979787
+    },
+    {
+      "url": "http://127.0.0.1:8099/lazy-tabs.html",
+      "ok": true,
+      "ms": 1660,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 3644,
+      "treeBytes": 168,
+      "treeSha256": "07c18c79f8bc95fd0d173c8f70b35126b47686d2ef4f8fcc0a1c7fc20b0cb8d2",
+      "reduction": 0.9538968166849616
+    },
+    {
+      "url": "https://example.com",
+      "ok": true,
+      "ms": 1721,
+      "staticTexts": 6,
+      "missing": [],
+      "rawBytes": 11752,
+      "treeBytes": 1128,
+      "treeSha256": "e1ca5d412f16e50202f0f8050f98ffd1b7792814409f9558cd675f5b9045c6c3",
+      "reduction": 0.9040163376446563
+    },
+    {
+      "url": "https://news.ycombinator.com",
+      "ok": true,
+      "ms": 1916,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 375952,
+      "treeBytes": 12885,
+      "treeSha256": "f5e077ca11695f5989cfde8fc61eabf0b87ca0e1ebe7531f0c70ec8a61e622f6",
+      "reduction": 0.965727007703111
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Main_Page",
+      "ok": true,
+      "ms": 2647,
+      "staticTexts": 278,
+      "missing": [],
+      "rawBytes": 1338436,
+      "treeBytes": 91369,
+      "treeSha256": "520353ceb2d21633e7a72f90d342bfeca98a9363fb833013508003aac7f33dd9",
+      "reduction": 0.931734502060614
+    }
+  ],
+  "summary": {
+    "pages": 17,
+    "failed": 0,
+    "missing": 0
+  }
+}

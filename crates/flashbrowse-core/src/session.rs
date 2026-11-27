@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flashbrowse_cdp::protocol::{browser, dom, input, network, page, runtime, target};
+use flashbrowse_cdp::protocol::{
+    browser, dom, emulation, fetch, input, network, page, runtime, target,
+};
 use flashbrowse_cdp::{CdpClient, CdpError, ChromeProcess, LaunchOptions};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -16,26 +18,109 @@ use crate::driver::{BrowserDriver, CdpDriver, FrameSession};
 use crate::engine::BrowserEngine;
 use crate::interceptor::{blocked_patterns, blocked_patterns_for_screenshot};
 use crate::markdown::EXTRACT_SCRIPT;
+use crate::observability_session::{
+    recv_until_stop, spawn_supervised, ConsoleEntry, ConsoleTracker, NetworkEntry,
+    NetworkLogTracker, RouteInterceptor, RouteRule,
+};
 use crate::resource_policy::ResourcePolicy;
 use crate::stealth::{
     build_ua_override, stealth_script, StealthProfile, SETTLE_DIAGNOSTICS_SCRIPT,
 };
 use crate::tree::{compress, render_nested, ActionMap};
 
+/// Best-effort cleanup for an isolated Chrome context while unwinding or when
+/// an operation is cancelled. The explicit async cleanup path disarms this
+/// guard only after Chrome confirms disposal.
+struct BrowserContextCleanup {
+    client: Arc<CdpClient>,
+    browser_context_id: Option<String>,
+}
+
+impl BrowserContextCleanup {
+    fn new(client: Arc<CdpClient>, browser_context_id: String) -> Self {
+        Self {
+            client,
+            browser_context_id: Some(browser_context_id),
+        }
+    }
+
+    async fn dispose(&mut self) -> Result<(), CdpError> {
+        let Some(browser_context_id) = self.browser_context_id.as_deref() else {
+            return Ok(());
+        };
+        target::dispose_browser_context(&self.client, browser_context_id).await?;
+        self.browser_context_id = None;
+        Ok(())
+    }
+}
+
+impl Drop for BrowserContextCleanup {
+    fn drop(&mut self) {
+        let Some(browser_context_id) = self.browser_context_id.take() else {
+            return;
+        };
+        let client = Arc::clone(&self.client);
+        let schedule = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match flashbrowse_cdp::runtime::spawn(async move {
+                match flashbrowse_cdp::runtime::run(target::dispose_browser_context(
+                    &client,
+                    &browser_context_id,
+                ))
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) | Err(error) => {
+                        tracing::warn!(%error, "deferred isolated browser context cleanup failed");
+                    }
+                }
+            }) {
+                Ok(_task) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not schedule isolated browser context cleanup");
+                }
+            }
+        }));
+        if let Err(payload) = schedule {
+            flashbrowse_cdp::runtime::discard_panic_payload(payload);
+        }
+    }
+}
+
+/// Close the CDP client if screenshot preparation exits before restoring the
+/// active resource policy. This also runs while an internal panic unwinds, so
+/// callers cannot keep using a session with screenshot-only policy applied.
+struct ScreenshotGuard<'a> {
+    client: &'a CdpClient,
+    armed: bool,
+}
+
+impl Drop for ScreenshotGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(payload) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.client.shutdown()))
+            {
+                flashbrowse_cdp::runtime::discard_panic_payload(payload);
+            }
+        }
+    }
+}
+
 const SETTLE_DOM_STATS_JS: &str = r#"(() => {
   let count = 0;
   let textLen = document.body ? document.body.innerText.length : 0;
-  const walk = (root) => {
+  const pending = [document];
+  while (pending.length) {
+    const root = pending.pop();
     const els = root.querySelectorAll('*');
     count += els.length;
     for (const el of els) {
       if (el.shadowRoot) {
         textLen += (el.shadowRoot.textContent || '').length;
-        walk(el.shadowRoot);
+        pending.push(el.shadowRoot);
       }
     }
-  };
-  walk(document);
+  }
   return `${document.readyState}|${count}|${textLen}`;
 })()"#;
 
@@ -135,19 +220,18 @@ fn download_directory(config: &SessionConfig) -> PathBuf {
         .join("downloads")
 }
 
-fn install_download_tracker(client: &Arc<CdpClient>) -> DownloadTracker {
+fn install_download_tracker(
+    client: &Arc<CdpClient>,
+    stop: tokio::sync::watch::Receiver<()>,
+) -> DownloadTracker {
     let downloads: DownloadTracker = Arc::default();
     let mut begun = client.events().subscribe("Browser.downloadWillBegin");
     let mut progress = client.events().subscribe("Browser.downloadProgress");
     let begin_state = downloads.clone();
     let progress_state = downloads.clone();
-    tokio::spawn(async move {
-        loop {
-            let event = match begun.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
+    let mut stop_begin = stop.clone();
+    spawn_supervised(client, async move {
+        while let Some(event) = recv_until_stop(&mut begun, &mut stop_begin).await {
             let Some(guid) = event.get("guid").and_then(Value::as_str) else {
                 continue;
             };
@@ -174,13 +258,9 @@ fn install_download_tracker(client: &Arc<CdpClient>) -> DownloadTracker {
             }
         }
     });
-    tokio::spawn(async move {
-        loop {
-            let event = match progress.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
+    let mut stop_progress = stop;
+    spawn_supervised(client, async move {
+        while let Some(event) = recv_until_stop(&mut progress, &mut stop_progress).await {
             let Some(guid) = event.get("guid").and_then(Value::as_str) else {
                 continue;
             };
@@ -227,12 +307,14 @@ impl SessionConfig {
 type PopupTracker = Arc<std::sync::Mutex<Vec<target::TargetInfo>>>;
 
 fn record_popup_target(tracker: &PopupTracker, info: target::TargetInfo) {
-    if info.kind != "page" {
+    if info.kind != "page" || info.opener_id.is_none() {
         return;
     }
     if let Ok(mut list) = tracker.lock() {
         if let Some(pos) = list.iter().position(|t| t.target_id == info.target_id) {
-            list[pos] = info;
+            if let Some(existing) = list.get_mut(pos) {
+                *existing = info;
+            }
         } else {
             list.push(info);
         }
@@ -257,13 +339,17 @@ fn take_popup_from_tracker(
     Some(picked)
 }
 
-fn install_popup_tracker(client: &Arc<CdpClient>) -> PopupTracker {
+fn install_popup_tracker(
+    client: &Arc<CdpClient>,
+    stop: tokio::sync::watch::Receiver<()>,
+) -> PopupTracker {
     let tracker: PopupTracker = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let mut created_rx = client.events().subscribe("Target.targetCreated");
     let t_created = tracker.clone();
-    tokio::spawn(async move {
-        while let Ok(v) = created_rx.recv().await {
+    let mut stop_created = stop.clone();
+    spawn_supervised(client, async move {
+        while let Some(v) = recv_until_stop(&mut created_rx, &mut stop_created).await {
             if let Ok(ev) = serde_json::from_value::<target::TargetCreatedEvent>(v) {
                 record_popup_target(&t_created, ev.target_info);
             }
@@ -272,8 +358,9 @@ fn install_popup_tracker(client: &Arc<CdpClient>) -> PopupTracker {
 
     let mut attached_rx = client.events().subscribe("Target.attachedToTarget");
     let t_attached = tracker.clone();
-    tokio::spawn(async move {
-        while let Ok(v) = attached_rx.recv().await {
+    let mut stop_attached = stop;
+    spawn_supervised(client, async move {
+        while let Some(v) = recv_until_stop(&mut attached_rx, &mut stop_attached).await {
             if let Ok(ev) = serde_json::from_value::<target::AttachedToTargetEvent>(v) {
                 record_popup_target(&t_attached, ev.target_info);
             }
@@ -304,25 +391,24 @@ fn install_dialog_handler(
     client: &Arc<CdpClient>,
     session_id: &str,
     policy: DialogPolicy,
+    mut stop: tokio::sync::watch::Receiver<()>,
 ) -> Arc<std::sync::Mutex<DialogState>> {
     let state = Arc::new(std::sync::Mutex::new(DialogState {
         policy,
         ..DialogState::default()
     }));
-    let mut events = client.events().subscribe("Page.javascriptDialogOpening");
+    let mut events = client
+        .events()
+        .subscribe_envelopes("Page.javascriptDialogOpening");
     let state_for_task = Arc::downgrade(&state);
-    let client = client.clone();
+    let dialog_client = client.clone();
     let session_id = session_id.to_string();
-    tokio::spawn(async move {
-        loop {
-            let event = match events.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                    tracing::warn!(count, "missed JavaScript dialog events");
-                    continue;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            };
+    spawn_supervised(client, async move {
+        while let Some(env) = recv_until_stop(&mut events, &mut stop).await {
+            if env.session_id.as_deref() != Some(session_id.as_str()) {
+                continue;
+            }
+            let event = env.params;
             let Some(state_arc) = state_for_task.upgrade() else {
                 break;
             };
@@ -350,12 +436,16 @@ fn install_dialog_handler(
                 };
                 (accepted, prompt_text)
             };
-            let mut params = serde_json::json!({"accept": accepted});
+            let mut params = serde_json::Map::from_iter([("accept".into(), Value::Bool(accepted))]);
             if let Some(prompt_text) = prompt_text {
-                params["promptText"] = Value::String(prompt_text);
+                params.insert("promptText".into(), Value::String(prompt_text));
             }
-            let response: Result<Value, CdpError> = client
-                .send(Some(&session_id), "Page.handleJavaScriptDialog", params)
+            let response: Result<Value, CdpError> = dialog_client
+                .send(
+                    Some(&session_id),
+                    "Page.handleJavaScriptDialog",
+                    Value::Object(params),
+                )
                 .await;
             match response {
                 Ok(_) => {
@@ -385,6 +475,19 @@ pub struct FillFormOutcome {
     pub tree: String,
 }
 
+/// Condition for [`BrowserSession::wait_for`].
+#[derive(Debug, Clone)]
+pub enum WaitCondition {
+    /// Wait until visible text appears in the document or an open shadow root.
+    Text(String),
+    /// Wait until a CSS selector matches in the document or an open shadow root.
+    Selector(String),
+    /// Wait until `location.href` contains the given substring.
+    UrlContains(String),
+    /// Wait until no in-flight network requests exist for at least `quiet_ms`.
+    NetworkIdle { quiet_ms: u64 },
+}
+
 /// Options for [`BrowserSession::screenshot`].
 #[derive(Debug, Clone)]
 pub struct ScreenshotOptions {
@@ -393,6 +496,8 @@ pub struct ScreenshotOptions {
     pub prepare_lazy_content: bool,
     /// Max time to wait for network/images before best-effort capture.
     pub timeout_ms: u64,
+    /// Optional element ID to clip the screenshot to its bounding box.
+    pub action_id: Option<u32>,
 }
 
 impl Default for ScreenshotOptions {
@@ -401,6 +506,51 @@ impl Default for ScreenshotOptions {
             full_page: false,
             prepare_lazy_content: true,
             timeout_ms: 8_000,
+            action_id: None,
+        }
+    }
+}
+
+/// Viewport dimensions for [`BrowserSession::emulate`].
+#[derive(Debug, Clone)]
+pub struct ViewportOptions {
+    pub width: i32,
+    pub height: i32,
+    pub device_scale_factor: f64,
+    pub mobile: bool,
+}
+
+/// Geolocation override for [`BrowserSession::emulate`].
+#[derive(Debug, Clone)]
+pub struct GeolocationOptions {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub accuracy: f64,
+}
+
+/// Device, locale, timezone, and geolocation emulation options.
+#[derive(Debug, Clone, Default)]
+pub struct EmulationOptions {
+    pub viewport: Option<ViewportOptions>,
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+    pub geolocation: Option<GeolocationOptions>,
+}
+
+/// Options for [`BrowserSession::print_to_pdf`].
+#[derive(Debug, Clone)]
+pub struct PdfOptions {
+    pub landscape: bool,
+    pub print_background: bool,
+    pub scale: f64,
+}
+
+impl Default for PdfOptions {
+    fn default() -> Self {
+        Self {
+            landscape: false,
+            print_background: true,
+            scale: 1.0,
         }
     }
 }
@@ -444,6 +594,11 @@ impl NetActivity {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
     }
 
+    fn reset(&self) {
+        self.inflight.store(0, Ordering::Relaxed);
+        self.touch();
+    }
+
     fn start(&self) {
         if self.inflight.fetch_add(1, Ordering::Relaxed) == 0 {
             self.started_at_ms.store(now_ms(), Ordering::Relaxed);
@@ -473,13 +628,25 @@ impl NetActivity {
         now_ms().saturating_sub(self.started_at_ms.load(Ordering::Relaxed)) >= HUNG_REQUEST_MS
     }
 
-    /// Subscribe to the network events that drive the tracker.
-    fn attach(&self, events: &flashbrowse_cdp::EventEmitter) {
+    /// Subscribe to the network events that drive the tracker (scoped to `session_id`).
+    fn attach(
+        &self,
+        client: &Arc<CdpClient>,
+        session_id: &str,
+        stop: tokio::sync::watch::Receiver<()>,
+    ) {
+        let events = client.events();
         let this = self.clone();
-        let mut rx = events.subscribe("Network.requestWillBeSent");
-        tokio::spawn(async move {
-            while let Ok(v) = rx.recv().await {
-                let url = v
+        let sid = session_id.to_string();
+        let mut rx = events.subscribe_envelopes("Network.requestWillBeSent");
+        let mut stop_start = stop.clone();
+        spawn_supervised(client, async move {
+            while let Some(env) = recv_until_stop(&mut rx, &mut stop_start).await {
+                if env.session_id.as_deref() != Some(sid.as_str()) {
+                    continue;
+                }
+                let url = env
+                    .params
                     .get("request")
                     .and_then(|r| r.get("url"))
                     .and_then(|u| u.as_str())
@@ -495,17 +662,25 @@ impl NetActivity {
             }
         });
         let this = self.clone();
-        let mut rx = events.subscribe("Network.loadingFinished");
-        tokio::spawn(async move {
-            while rx.recv().await.is_ok() {
-                this.finish();
+        let sid = session_id.to_string();
+        let mut rx = events.subscribe_envelopes("Network.loadingFinished");
+        let mut stop_done = stop.clone();
+        spawn_supervised(client, async move {
+            while let Some(env) = recv_until_stop(&mut rx, &mut stop_done).await {
+                if env.session_id.as_deref() == Some(sid.as_str()) {
+                    this.finish();
+                }
             }
         });
         let this = self.clone();
-        let mut rx = events.subscribe("Network.loadingFailed");
-        tokio::spawn(async move {
-            while rx.recv().await.is_ok() {
-                this.finish();
+        let sid = session_id.to_string();
+        let mut rx = events.subscribe_envelopes("Network.loadingFailed");
+        let mut stop_fail = stop;
+        spawn_supervised(client, async move {
+            while let Some(env) = recv_until_stop(&mut rx, &mut stop_fail).await {
+                if env.session_id.as_deref() == Some(sid.as_str()) {
+                    this.finish();
+                }
             }
         });
     }
@@ -538,12 +713,23 @@ pub struct BrowserSession {
     title: String,
     url: String,
     last_tree: String,
-    /// Timing breakdown of the most recent `open` (Phase 0 instrumentation).
+    /// Timing breakdown of the most recent `open` operation.
     last_settle: Option<crate::observability::SettleBreakdown>,
     dialog_state: Arc<std::sync::Mutex<DialogState>>,
     downloads: DownloadTracker,
     download_dir: PathBuf,
     popups: PopupTracker,
+    console: ConsoleTracker,
+    network_log: NetworkLogTracker,
+    routes: RouteInterceptor,
+    extra_headers: HashMap<String, String>,
+    /// Context reported for the current target, including Chrome's default
+    /// context. This scopes tab listing and recovery.
+    target_context_id: Option<String>,
+    /// Isolated context created and owned by this session, if any.
+    browser_context_id: Option<String>,
+    /// Dropping this wakes and stops all background CDP event tasks for this session.
+    _stop_tx: tokio::sync::watch::Sender<()>,
 }
 
 /// Legacy settle result kept while the candidate is measured in shadow mode.
@@ -557,13 +743,17 @@ struct SettleSnapshot {
 impl BrowserSession {
     /// Launch Chromium, attach, apply stealth + network filtering.
     pub async fn launch(config: SessionConfig) -> Result<Self, CoreError> {
+        flashbrowse_cdp::runtime::run(Self::launch_inner(config)).await?
+    }
+
+    async fn launch_inner(config: SessionConfig) -> Result<Self, CoreError> {
         config.validate_engine()?;
         if let Some(endpoint) = config.cdp_url.as_deref() {
             let ws_url =
                 flashbrowse_cdp::protocol::browser::resolve_websocket_url(endpoint).await?;
             return Self::attach(ws_url, None, &config).await;
         }
-        let mut chrome = flashbrowse_cdp::launch_chrome(LaunchOptions {
+        let (chrome, client) = flashbrowse_cdp::launcher::launch_connected_chrome(LaunchOptions {
             chrome_path: config.chrome_path.clone(),
             extra_args: config.extra_args.clone(),
             no_sandbox: config.no_sandbox,
@@ -572,19 +762,34 @@ impl BrowserSession {
             persistent: config.persistent,
         })
         .await?;
-        let client = Arc::new(CdpClient::connect_chrome(&mut chrome).await?);
+        let client = Arc::new(client);
         target::set_discover_targets(&client, true).await?;
-        let popups = install_popup_tracker(&client);
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        let popups = install_popup_tracker(&client, stop_rx.clone());
         let t = target::create_target(&client, "about:blank").await?;
+        let target_context_id = target::get_targets(&client)
+            .await?
+            .target_infos
+            .into_iter()
+            .find(|target| target.target_id == t.target_id)
+            .ok_or_else(|| {
+                CoreError::NavigationFailed(format!(
+                    "new browser tab is no longer available: {}",
+                    t.target_id
+                ))
+            })?
+            .browser_context_id;
         let s = target::attach_to_target(&client, &t.target_id).await?;
         let session_id = s.session_id.clone();
-        let dialog_state = install_dialog_handler(&client, &session_id, config.dialog_policy);
+        let dialog_state =
+            install_dialog_handler(&client, &session_id, config.dialog_policy, stop_rx.clone());
 
         // Domains must be enabled before navigate so events + AXTree work.
         // Parallelized (was 3 sequential round-trips).
-        let (page_r, net_r, acc_r) = tokio::join!(
+        let (page_r, net_r, rt_r, acc_r) = tokio::join!(
             page::enable(&client, &session_id),
             network::enable(&client, &session_id),
+            runtime::enable(&client, &session_id),
             client.send(
                 Some(&session_id),
                 "Accessibility.enable",
@@ -593,18 +798,19 @@ impl BrowserSession {
         );
         page_r?;
         net_r?;
+        rt_r?;
         let download_dir = download_directory(&config);
         std::fs::create_dir_all(&download_dir).map_err(|error| {
             CoreError::NavigationFailed(format!("cannot create download directory: {error}"))
         })?;
-        let downloads = install_download_tracker(&client);
+        let downloads = install_download_tracker(&client, stop_rx.clone());
         flashbrowse_cdp::protocol::browser::set_download_behavior(
             &client,
             &download_dir.to_string_lossy(),
         )
         .await?;
         page::set_download_behavior(&client, &session_id, &download_dir.to_string_lossy()).await?;
-        let _: Value = acc_r.unwrap_or(serde_json::json!({}));
+        let _: Value = acc_r?;
 
         let stealth_js = stealth_script(config.stealth_profile);
         let (s_r, b_r, u_r) = tokio::join!(
@@ -626,7 +832,10 @@ impl BrowserSession {
 
         let browser_ws_url = chrome.browser_ws_url().to_string();
         let net = NetActivity::new();
-        net.attach(&client.events());
+        net.attach(&client, &session_id, stop_rx.clone());
+        let console = ConsoleTracker::install(&client, &session_id, stop_rx.clone());
+        let network_log = NetworkLogTracker::install(&client, &session_id, stop_rx.clone());
+        let routes = RouteInterceptor::install(&client, &session_id, stop_rx);
         let driver: Box<dyn BrowserDriver> =
             Box::new(CdpDriver::new(client.clone(), session_id.clone()));
         Ok(Self {
@@ -648,6 +857,13 @@ impl BrowserSession {
             downloads,
             download_dir,
             popups,
+            console,
+            network_log,
+            routes,
+            extra_headers: HashMap::new(),
+            target_context_id,
+            browser_context_id: None,
+            _stop_tx: stop_tx,
         })
     }
 
@@ -660,6 +876,14 @@ impl BrowserSession {
     /// `Network.setBlockedURLs` are scoped to the CDP *session*, so they are
     /// re-applied on every attach (a new `sessionId` is minted each time).
     pub async fn attach(
+        ws_url: String,
+        target_id: Option<String>,
+        config: &SessionConfig,
+    ) -> Result<Self, CoreError> {
+        flashbrowse_cdp::runtime::run(Self::attach_inner(ws_url, target_id, config)).await?
+    }
+
+    async fn attach_inner(
         ws_url: String,
         target_id: Option<String>,
         config: &SessionConfig,
@@ -677,23 +901,52 @@ impl BrowserSession {
     ) -> Result<Self, CoreError> {
         config.validate_engine()?;
         target::set_discover_targets(&client, true).await?;
-        let popups = install_popup_tracker(&client);
-        let tid = match target_id {
-            Some(t) => t,
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        let popups = install_popup_tracker(&client, stop_rx.clone());
+        let (tid, target_context_id) = match target_id {
+            Some(tid) => {
+                let targets = target::get_targets(&client).await?;
+                let context_id = targets
+                    .target_infos
+                    .iter()
+                    .find(|target| target.target_id == tid)
+                    .ok_or_else(|| {
+                        CoreError::NavigationFailed(format!(
+                            "page target is no longer available: {tid}"
+                        ))
+                    })?
+                    .browser_context_id
+                    .clone();
+                (tid, context_id)
+            }
             None => {
-                target::create_target(&client, "about:blank")
+                let target_id = target::create_target(&client, "about:blank")
                     .await?
-                    .target_id
+                    .target_id;
+                let context_id = target::get_targets(&client)
+                    .await?
+                    .target_infos
+                    .into_iter()
+                    .find(|target| target.target_id == target_id)
+                    .ok_or_else(|| {
+                        CoreError::NavigationFailed(format!(
+                            "new browser tab is no longer available: {target_id}"
+                        ))
+                    })?
+                    .browser_context_id;
+                (target_id, context_id)
             }
         };
         let s = target::attach_to_target(&client, &tid).await?;
         let session_id = s.session_id.clone();
-        let dialog_state = install_dialog_handler(&client, &session_id, config.dialog_policy);
+        let dialog_state =
+            install_dialog_handler(&client, &session_id, config.dialog_policy, stop_rx.clone());
 
         // Domains (parallel - 1 round-trip instead of 3).
-        let (p_r, n_r, a_r) = tokio::join!(
+        let (p_r, n_r, rt_r, a_r) = tokio::join!(
             page::enable(&client, &session_id),
             network::enable(&client, &session_id),
+            runtime::enable(&client, &session_id),
             client.send(
                 Some(&session_id),
                 "Accessibility.enable",
@@ -702,18 +955,19 @@ impl BrowserSession {
         );
         p_r?;
         n_r?;
+        rt_r?;
         let download_dir = download_directory(config);
         std::fs::create_dir_all(&download_dir).map_err(|error| {
             CoreError::NavigationFailed(format!("cannot create download directory: {error}"))
         })?;
-        let downloads = install_download_tracker(&client);
+        let downloads = install_download_tracker(&client, stop_rx.clone());
         flashbrowse_cdp::protocol::browser::set_download_behavior(
             &client,
             &download_dir.to_string_lossy(),
         )
         .await?;
         page::set_download_behavior(&client, &session_id, &download_dir.to_string_lossy()).await?;
-        let _: Value = a_r.unwrap_or(serde_json::json!({}));
+        let _: Value = a_r?;
 
         // Per-session settings: always re-apply (parallel).
         let stealth_js = stealth_script(config.stealth_profile);
@@ -735,7 +989,10 @@ impl BrowserSession {
         }
 
         let net = NetActivity::new();
-        net.attach(&client.events());
+        net.attach(&client, &session_id, stop_rx.clone());
+        let console = ConsoleTracker::install(&client, &session_id, stop_rx.clone());
+        let network_log = NetworkLogTracker::install(&client, &session_id, stop_rx.clone());
+        let routes = RouteInterceptor::install(&client, &session_id, stop_rx);
         let driver: Box<dyn BrowserDriver> =
             Box::new(CdpDriver::new(client.clone(), session_id.clone()));
         let mut sess = Self {
@@ -757,10 +1014,17 @@ impl BrowserSession {
             downloads,
             download_dir,
             popups,
+            console,
+            network_log,
+            routes,
+            extra_headers: HashMap::new(),
+            target_context_id,
+            browser_context_id: None,
+            _stop_tx: stop_tx,
         };
         // Wait for the popup document to finish loading and remain quiet long
         // enough for post-load hydration before creating its first action map.
-        sess.wait_for_popup_settle().await;
+        sess.wait_for_popup_settle().await?;
         // Seed title/url + action_map so `act` never uses a blank map.
         // Propagate failures (H6): a blank map must not masquerade as
         // "ActionNotFound" later.
@@ -769,8 +1033,16 @@ impl BrowserSession {
         Ok(sess)
     }
 
-    async fn wait_for_popup_settle(&self) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    async fn wait_for_popup_settle(&self) -> Result<(), CoreError> {
+        flashbrowse_cdp::runtime::run(self.wait_for_popup_settle_inner()).await?;
+        Ok(())
+    }
+
+    async fn wait_for_popup_settle_inner(&self) {
+        let deadline = {
+            let now = std::time::Instant::now();
+            now.checked_add(Duration::from_secs(5)).unwrap_or(now)
+        };
         let mut previous = None;
         let mut stable_since = std::time::Instant::now();
         loop {
@@ -827,43 +1099,35 @@ impl BrowserSession {
     /// metadata for the session file. The CdpClient socket is closed
     /// (pending calls drained); the target page persists in Chromium.
     pub fn detach(mut self) -> DetachedSession {
-        let ws_url = self.browser_ws_url.clone();
-        let tid = self.target_id.clone();
-        let resource_policy = self.resource_policy;
-        let (pid, user_data_dir) = match self.chrome.take() {
-            Some(proc) => {
-                let pid = proc.pid().unwrap_or(0);
-                let dir = proc.user_data_dir().clone();
-                if let Some((child, _dir)) = proc.detach() {
-                    // Forget Child so kill_on_drop does not kill the daemon browser.
-                    std::mem::forget(child);
-                }
-                (pid, dir)
+        let metadata = self.detached_metadata();
+        if let Some(proc) = self.chrome.take() {
+            if let Some((child, _dir)) = proc.detach() {
+                // Forget Child so kill_on_drop does not kill the daemon browser.
+                std::mem::forget(child);
             }
-            None => (0, PathBuf::new()),
-        };
+        }
         self.client.shutdown();
+        metadata
+    }
+
+    /// Return the information needed to persist a session while retaining ownership.
+    pub fn detached_metadata(&self) -> DetachedSession {
         DetachedSession {
-            browser_ws_url: ws_url,
-            target_id: tid,
-            pid,
-            user_data_dir,
-            resource_policy,
+            browser_ws_url: self.browser_ws_url.clone(),
+            target_id: self.target_id.clone(),
+            pid: self.pid().unwrap_or(0),
+            user_data_dir: self.user_data_dir().cloned().unwrap_or_default(),
+            resource_policy: self.resource_policy,
         }
     }
 
     /// Navigate and return the compressed, numbered action tree.
     ///
-    /// ACCURACY FIRST:
-    /// 1. Wait for the `load` lifecycle event of THIS navigation
-    ///    (`Page.lifecycleEvent` carries `loaderId`, unlike
-    ///    `Page.loadEventFired`, so stale events cannot fool us).
-    /// 2. Then poll the AX tree until it is *stable* (same semantic node
-    ///    count twice in a row, 100 ms apart, max 500 ms) so late
-    ///    hydration is never truncated.
-    ///
-    /// Cost control: the first tree fetch is reused (never discarded), and
-    /// title/url are fetched in the same round-trip batch.
+    /// Return a tree only after the current navigation has a stable,
+    /// non-empty accessibility snapshot. The settle loop checks document
+    /// readiness, DOM quiet time, and a semantic AX fingerprint. If it cannot
+    /// verify stability within 15 seconds, it returns an error and invalidates
+    /// the action map instead of exposing the latest partial snapshot.
     pub async fn open(&mut self, url: &str) -> Result<String, CoreError> {
         self.open_with_raw_snapshot(url)
             .await
@@ -883,13 +1147,29 @@ impl BrowserSession {
         ),
         CoreError,
     > {
+        flashbrowse_cdp::runtime::run(self.open_with_raw_snapshot_inner(url)).await?
+    }
+
+    async fn open_with_raw_snapshot_inner(
+        &mut self,
+        url: &str,
+    ) -> Result<
+        (
+            String,
+            Vec<flashbrowse_cdp::protocol::accessibility::AXNode>,
+        ),
+        CoreError,
+    > {
         let t_open = std::time::Instant::now();
         let shadow_enabled = settle_shadow_enabled();
         // Subscribe before navigating: a broadcast channel only delivers
         // events emitted after `subscribe`, so this cannot miss this
         // navigation's AX completion. `Accessibility.enable` is already on
         // (see `launch`/`attach`), so the event stream exists at zero cost.
-        let mut ax_complete_rx = self.client.events().subscribe("Accessibility.loadComplete");
+        let mut ax_complete_rx = self
+            .client
+            .events()
+            .subscribe_envelopes("Accessibility.loadComplete");
         // `Page.navigate` returns before the new document commits. Until the
         // commit event for THIS navigation arrives, the DOM, the readyState
         // and the AX tree all still belong to the previous page, so observing
@@ -941,7 +1221,7 @@ impl BrowserSession {
         let mut map = ActionMap::new();
         let mut action_sessions: HashMap<u32, FrameSession> = HashMap::new();
         let mut fingerprint = 0u64;
-        // Phase 0 instrumentation: disjoint stage timers, reported through
+        // Separate stage timers are reported through
         // `SettleBreakdown` so a speedup claim can be checked against evidence.
         let mut poll_ms = 0u64;
         let mut sleep_ms = 0u64;
@@ -991,7 +1271,10 @@ impl BrowserSession {
         // population). A slow network can need several seconds just to
         // deliver the HTML, so the budget must not be shorter than the CDP
         // call timeout we already allow elsewhere (15s).
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(15000);
+        let deadline = {
+            let now = tokio::time::Instant::now();
+            now.checked_add(Duration::from_millis(15000)).unwrap_or(now)
+        };
         // Poll more often without shortening the evidence window. Every
         // acceptance still requires a stable AX fingerprint and full quiet
         // interval.
@@ -1008,9 +1291,12 @@ impl BrowserSession {
         // Defensive fallback: a page whose commit event never arrives must not
         // hang the settle. After this, the loop trusts its own readyState and
         // DOM checks as before.
-        let commit_fallback = tokio::time::Instant::now() + Duration::from_millis(3000);
+        let commit_fallback = {
+            let now = tokio::time::Instant::now();
+            now.checked_add(Duration::from_millis(3000)).unwrap_or(now)
+        };
         loop {
-            iterations += 1;
+            iterations = iterations.saturating_add(1);
             // Deadline check FIRST: every `continue` path below must be
             // able to exit the loop (a page that keeps changing would
             // otherwise spin forever).
@@ -1018,7 +1304,7 @@ impl BrowserSession {
                 tracing::debug!(
                     raw_ax_nodes,
                     semantic = nodes.len(),
-                    "settle deadline reached - using latest tree"
+                    "settle deadline reached before the page stabilized"
                 );
                 break;
             }
@@ -1026,8 +1312,10 @@ impl BrowserSession {
             // Chrome emits `Accessibility.loadComplete` once the tree for the
             // loaded document is fully populated, which is what separates a
             // legitimately sparse tree from one that is merely early.
-            while ax_complete_rx.try_recv().is_ok() {
-                ax_complete = true;
+            while let Ok(env) = ax_complete_rx.try_recv() {
+                if env.session_id.as_deref() == Some(self.session_id.as_str()) {
+                    ax_complete = true;
+                }
             }
             // Wait for this navigation's document to commit before observing
             // anything. Any event with the matching loaderId means the new
@@ -1053,7 +1341,7 @@ impl BrowserSession {
                     if iterations > 1 {
                         let t_sleep = std::time::Instant::now();
                         tokio::time::sleep(Duration::from_millis(tick_ms)).await;
-                        sleep_ms += t_sleep.elapsed().as_millis() as u64;
+                        sleep_ms = sleep_ms.saturating_add(t_sleep.elapsed().as_millis() as u64);
                     }
                     continue;
                 }
@@ -1065,7 +1353,7 @@ impl BrowserSession {
             // window. The tick is what keeps the settle at one window.
             let t_sleep = std::time::Instant::now();
             tokio::time::sleep(Duration::from_millis(tick_ms)).await;
-            sleep_ms += t_sleep.elapsed().as_millis() as u64;
+            sleep_ms = sleep_ms.saturating_add(t_sleep.elapsed().as_millis() as u64);
 
             // (1) cheap change detection: is the document still moving?
             let mut ready_state = String::from("loading");
@@ -1107,7 +1395,7 @@ impl BrowserSession {
                     }
                 }
             }
-            poll_ms += t_poll.elapsed().as_millis() as u64;
+            poll_ms = poll_ms.saturating_add(t_poll.elapsed().as_millis() as u64);
             // "loading" = the document is still streaming; "interactive" = the
             // DOM is parsed but subresources (JS bundles!) are still coming;
             // "complete" = the browser considers the page fully loaded.
@@ -1189,7 +1477,7 @@ impl BrowserSession {
             let elapsed_ms = last_change.elapsed().as_millis() as u64;
             let prefetch_due = prefetch_lead_ms > 0
                 && !candidate_quiet_enough
-                && elapsed_ms + prefetch_lead_ms >= candidate_quiet_ms;
+                && elapsed_ms.saturating_add(prefetch_lead_ms) >= candidate_quiet_ms;
 
             // Fetch when the tree looks unready (it must be refreshed while
             // we wait for it), when the DOM settled, or when the confirming
@@ -1204,20 +1492,20 @@ impl BrowserSession {
             // (3) verify the AX tree itself
             let t_fetch = std::time::Instant::now();
             let (fresh, node_sessions) = self.driver.get_full_ax_tree_with_sessions().await?;
-            ax_fetch_ms += t_fetch.elapsed().as_millis() as u64;
-            ax_fetches += 1;
+            ax_fetch_ms = ax_fetch_ms.saturating_add(t_fetch.elapsed().as_millis() as u64);
+            ax_fetches = ax_fetches.saturating_add(1);
             let t_compress = std::time::Instant::now();
             let raw_ax_nodes_before = raw_ax_nodes;
             raw_ax_nodes = fresh.len();
             let (n2, m2) = compress(&fresh);
             let fp2 = tree_fingerprint(&n2, &m2);
-            let ratio_ok = dom_count < 100 || (raw_ax_nodes as u64) * 4 >= dom_count;
+            let ratio_ok = dom_count < 100 || raw_ax_nodes as u64 >= dom_count.div_ceil(4);
             let same = raw_ax_nodes_before == raw_ax_nodes && fp2 == fingerprint;
             action_sessions = build_action_sessions(&n2, &node_sessions);
             nodes = n2;
             map = m2;
             fingerprint = fp2;
-            compress_ms += t_compress.elapsed().as_millis() as u64;
+            compress_ms = compress_ms.saturating_add(t_compress.elapsed().as_millis() as u64);
 
             let net_idle = self.net.idle(250);
             tracing::debug!(
@@ -1294,6 +1582,35 @@ impl BrowserSession {
                 break;
             }
         }
+        if legacy_snapshot.is_none() && exit_reason == "deadline" {
+            self.last_settle = Some(crate::observability::SettleBreakdown {
+                nav_ms,
+                poll_ms,
+                sleep_ms,
+                ax_fetch_ms,
+                compress_ms,
+                title_url_ms,
+                render_ms: 0,
+                iterations,
+                ax_fetches,
+                exit_reason: exit_reason.to_string(),
+                candidate_accept_ms,
+                legacy_tree_sha256: None,
+                candidate_tree_sha256: None,
+                shadow_diverged: None,
+                raw_ax_nodes: raw_ax_nodes as u64,
+                semantic_nodes: nodes.len() as u64,
+                mutation_count,
+                mutation_last_ms,
+                mutation_quiet_ms,
+                mutation_would_delay_candidate,
+            });
+            self.invalidate_tree();
+            return Err(CoreError::NavigationFailed(format!(
+                "page did not reach a stable accessibility tree within 15 seconds: {}",
+                self.url
+            )));
+        }
         let accepted_raw_nodes;
         if let Some(snapshot) = legacy_snapshot {
             nodes = snapshot.nodes;
@@ -1340,7 +1657,7 @@ impl BrowserSession {
         // and the header line was blank about one page in five.
         let t_titles_final = std::time::Instant::now();
         self.refresh_title_url().await;
-        title_url_ms += t_titles_final.elapsed().as_millis() as u64;
+        title_url_ms = title_url_ms.saturating_add(t_titles_final.elapsed().as_millis() as u64);
         let t_render = std::time::Instant::now();
         let rendered = render_nested(&self.title, &self.url, &nodes);
         let render_ms = t_render.elapsed().as_millis() as u64;
@@ -1401,7 +1718,8 @@ impl BrowserSession {
     /// ids from the *previous* page, which no longer exist. Acting on them
     /// makes CDP calls hang until they time out. Clearing them turns a
     /// stale action into an immediate, explicit "action not found".
-    fn invalidate_tree(&mut self) {
+    #[doc(hidden)]
+    pub fn invalidate_tree(&mut self) {
         self.action_map.clear();
         self.action_sessions.clear();
         self.last_tree.clear();
@@ -1496,6 +1814,7 @@ impl BrowserSession {
     /// Apply cookies and arrange localStorage restoration before page scripts,
     /// then reload the current document so the imported state takes effect.
     pub async fn import_storage_state(&mut self, state: &Value) -> Result<String, CoreError> {
+        flashbrowse_cdp::transport::validate_json_depth(state)?;
         let cookies = state
             .get("cookies")
             .and_then(Value::as_array)
@@ -1603,13 +1922,102 @@ impl BrowserSession {
         &self.download_dir
     }
 
+    /// Create a new isolated session inside an existing `browserContextId` on the same Chrome.
+    pub async fn new_in_context(
+        client: Arc<CdpClient>,
+        browser_ws_url: String,
+        browser_context_id: String,
+        config: &SessionConfig,
+    ) -> Result<Self, CoreError> {
+        let t = target::create_target_in_context(&client, "about:blank", Some(&browser_context_id))
+            .await?;
+        let mut sess =
+            Self::attach_with_client(client, browser_ws_url, Some(t.target_id), config).await?;
+        sess.browser_context_id = Some(browser_context_id);
+        Ok(sess)
+    }
+
+    /// Spawn an isolated incognito-like `BrowserSession` sharing this Chrome process.
+    pub async fn create_isolated_context(&self, config: &SessionConfig) -> Result<Self, CoreError> {
+        let cid = target::create_browser_context(&self.client).await?;
+        let mut cleanup = BrowserContextCleanup::new(self.client.clone(), cid.clone());
+        match Self::new_in_context(
+            self.client.clone(),
+            self.browser_ws_url.clone(),
+            cid.clone(),
+            config,
+        )
+        .await
+        {
+            Ok(sess) => {
+                cleanup.browser_context_id = None;
+                Ok(sess)
+            }
+            Err(err) => {
+                if let Err(cleanup_error) = cleanup.dispose().await {
+                    tracing::warn!(%cleanup_error, "isolated browser context cleanup failed after creation error");
+                }
+                Err(err)
+            }
+        }
+    }
+
+    pub fn current_url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn browser_context_id(&self) -> Option<&str> {
+        self.browser_context_id.as_deref()
+    }
+
     pub async fn list_tabs(&self) -> Result<Vec<target::TargetInfo>, CoreError> {
         let targets = target::get_targets(&self.client).await?;
         Ok(targets
             .target_infos
             .into_iter()
             .filter(|t| t.kind == "page")
+            .filter(|t| t.browser_context_id == self.target_context_id)
             .collect())
+    }
+
+    /// Reattach to a live page in this session's browser context if the active
+    /// page was closed outside flashbrowse. If its context has no pages left,
+    /// create a blank page in that same context before reattaching.
+    pub async fn recover_closed_active_tab(
+        &mut self,
+        config: &SessionConfig,
+    ) -> Result<Vec<target::TargetInfo>, CoreError> {
+        let mut tabs = self.list_tabs().await?;
+        if tabs.iter().any(|tab| tab.target_id == self.target_id) {
+            return Ok(tabs);
+        }
+
+        let target_id = tabs
+            .iter()
+            .find(|tab| !tab.url.starts_with("chrome://"))
+            .or_else(|| tabs.first())
+            .map(|tab| tab.target_id.clone());
+        let target_id = match target_id {
+            Some(target_id) => target_id,
+            None => {
+                target::create_target_in_context(
+                    &self.client,
+                    "about:blank",
+                    self.target_context_id.as_deref(),
+                )
+                .await?
+                .target_id
+            }
+        };
+
+        self.select_tab(&target_id, config).await?;
+        tabs = self.list_tabs().await?;
+        if !tabs.iter().any(|tab| tab.target_id == self.target_id) {
+            return Err(CoreError::NavigationFailed(
+                "could not restore an active page in the browser context".to_string(),
+            ));
+        }
+        Ok(tabs)
     }
 
     /// Consume the newest `page` target opened by `opener_id` from the
@@ -1637,7 +2045,9 @@ impl BrowserSession {
             )));
         }
         let ws_url = self.browser_ws_url.clone();
-        let _ = target::detach_from_target(&self.client, &self.session_id).await;
+        // Attach the replacement and re-apply per-session state before
+        // detaching the old session or moving the Chrome handle. If any of
+        // this fails, `self` stays attached and still owns the browser.
         let mut replacement = Self::attach_with_client(
             self.client.clone(),
             ws_url,
@@ -1645,6 +2055,24 @@ impl BrowserSession {
             config,
         )
         .await?;
+        replacement.browser_context_id = self.browser_context_id.clone();
+        let restore = async {
+            if !self.extra_headers.is_empty() {
+                replacement
+                    .set_extra_headers(self.extra_headers.clone())
+                    .await?;
+            }
+            for rule in self.routes.list_rules() {
+                replacement.add_route(rule).await?;
+            }
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        if let Err(error) = restore {
+            let _ = target::detach_from_target(&self.client, &replacement.session_id).await;
+            return Err(error);
+        }
+        let _ = target::detach_from_target(&self.client, &self.session_id).await;
         replacement.chrome = self.chrome.take();
         *self = replacement;
         Ok(self.last_tree.clone())
@@ -1666,11 +2094,6 @@ impl BrowserSession {
                 "unknown page target: {target_id}"
             )));
         }
-        if !target::close_target(&self.client, target_id).await? {
-            return Err(CoreError::NavigationFailed(format!(
-                "Chrome refused to close page target: {target_id}"
-            )));
-        }
         if target_id == self.target_id {
             let opener_id = tabs
                 .iter()
@@ -1682,9 +2105,24 @@ impl BrowserSession {
                     tabs.iter()
                         .find(|t| t.target_id != target_id && !t.url.starts_with("chrome://"))
                 })
-                .or_else(|| tabs.iter().find(|t| t.target_id != target_id))
-                .expect("remaining tab");
-            return self.select_tab(&next.target_id, config).await.map(Some);
+                .or_else(|| tabs.iter().find(|t| t.target_id != target_id));
+            let Some(next) = next else {
+                return Err(CoreError::NavigationFailed(
+                    "Chrome reported multiple tabs but no remaining tab was available".into(),
+                ));
+            };
+            let tree = self.select_tab(&next.target_id, config).await?;
+            if !target::close_target(&self.client, target_id).await? {
+                return Err(CoreError::NavigationFailed(format!(
+                    "Chrome refused to close page target: {target_id}"
+                )));
+            }
+            return Ok(Some(tree));
+        }
+        if !target::close_target(&self.client, target_id).await? {
+            return Err(CoreError::NavigationFailed(format!(
+                "Chrome refused to close page target: {target_id}"
+            )));
         }
         Ok(None)
     }
@@ -1761,8 +2199,8 @@ impl BrowserSession {
             return (0.0, 0.0);
         };
         if let Ok(resp) = dom::get_box_model(&self.client, &self.session_id, owner).await {
-            if resp.model.content.len() >= 2 {
-                return (resp.model.content[0], resp.model.content[1]);
+            if let [x, y, ..] = resp.model.content.as_slice() {
+                return (*x, *y);
             }
         }
         (0.0, 0.0)
@@ -1776,7 +2214,7 @@ impl BrowserSession {
             .ok_or(CoreError::ActionNotFound(action_id))?;
         let (dom_sid, owner) = self.frame_for_action(action_id);
         self.click_at_backend(&dom_sid, owner, backend).await?;
-        self.post_action_settle(Duration::from_millis(400)).await;
+        self.post_action_settle(Duration::from_millis(400)).await?;
         self.refresh_title_url().await;
         self.rebuild_tree().await
     }
@@ -1803,6 +2241,7 @@ impl BrowserSession {
                 x,
                 y,
                 button: None,
+                buttons: None,
                 click_count: None,
                 delta_x: None,
                 delta_y: None,
@@ -1810,7 +2249,7 @@ impl BrowserSession {
             },
         )
         .await?;
-        self.post_action_settle(Duration::from_millis(200)).await;
+        self.post_action_settle(Duration::from_millis(200)).await?;
         self.rebuild_tree().await
     }
 
@@ -1841,7 +2280,7 @@ impl BrowserSession {
             .ok_or(CoreError::ActionNotFound(action_id))?;
         let (dom_sid, owner) = self.frame_for_action(action_id);
         self.fill_backend(&dom_sid, owner, backend, text).await?;
-        self.post_action_settle(Duration::from_millis(200)).await;
+        self.post_action_settle(Duration::from_millis(200)).await?;
         self.rebuild_tree().await
     }
 
@@ -1869,7 +2308,7 @@ impl BrowserSession {
             }
             completed.push(*action_id);
         }
-        self.post_action_settle(Duration::from_millis(250)).await;
+        self.post_action_settle(Duration::from_millis(250)).await?;
         let tree = self.rebuild_tree().await?;
         Ok(FillFormOutcome {
             completed,
@@ -1878,21 +2317,214 @@ impl BrowserSession {
         })
     }
 
-    /// `scroll(direction, amount_px)`: synthetic `mouseWheel` → rebuild.
+    async fn resolve_action_center(&self, action_id: u32) -> Result<(f64, f64), CoreError> {
+        let backend = *self
+            .action_map
+            .get(&action_id)
+            .ok_or(CoreError::ActionNotFound(action_id))?;
+        let (dom_sid, owner) = self.frame_for_action(action_id);
+        let _ = dom::scroll_into_view_if_needed(&self.client, &dom_sid, backend).await;
+        let resp = dom::get_box_model(&self.client, &dom_sid, backend).await?;
+        let (cx, cy) = box_center(&resp.model).ok_or(CoreError::NoBoxModel(action_id))?;
+        let (ox, oy) = self.frame_offset(owner).await;
+        Ok((cx + ox, cy + oy))
+    }
+
+    /// `double_click(action_id)`: two synthetic clicks (`clickCount: 1` then `2`) -> rebuild.
+    pub async fn double_click(&mut self, action_id: u32) -> Result<String, CoreError> {
+        let (x, y) = self.resolve_action_center(action_id).await?;
+        let mv = input::DispatchMouseEventParams {
+            type_: "mouseMoved".to_string(),
+            x,
+            y,
+            button: None,
+            buttons: None,
+            click_count: None,
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        };
+        input::dispatch_mouse_event(&self.client, &self.session_id, &mv).await?;
+        for count in [1, 2] {
+            let down = input::DispatchMouseEventParams {
+                type_: "mousePressed".to_string(),
+                x,
+                y,
+                button: Some("left".to_string()),
+                buttons: Some(1),
+                click_count: Some(count),
+                delta_x: None,
+                delta_y: None,
+                modifiers: None,
+            };
+            input::dispatch_mouse_event(&self.client, &self.session_id, &down).await?;
+            let up = input::DispatchMouseEventParams {
+                type_: "mouseReleased".to_string(),
+                buttons: Some(0),
+                ..down
+            };
+            input::dispatch_mouse_event(&self.client, &self.session_id, &up).await?;
+        }
+        self.post_action_settle(Duration::from_millis(300)).await?;
+        self.refresh_title_url().await;
+        self.rebuild_tree().await
+    }
+
+    /// `right_click(action_id)`: synthetic secondary mouse button click -> rebuild.
+    pub async fn right_click(&mut self, action_id: u32) -> Result<String, CoreError> {
+        let (x, y) = self.resolve_action_center(action_id).await?;
+        let mv = input::DispatchMouseEventParams {
+            type_: "mouseMoved".to_string(),
+            x,
+            y,
+            button: None,
+            buttons: None,
+            click_count: None,
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        };
+        input::dispatch_mouse_event(&self.client, &self.session_id, &mv).await?;
+        let down = input::DispatchMouseEventParams {
+            type_: "mousePressed".to_string(),
+            x,
+            y,
+            button: Some("right".to_string()),
+            buttons: Some(2),
+            click_count: Some(1),
+            delta_x: None,
+            delta_y: None,
+            modifiers: None,
+        };
+        input::dispatch_mouse_event(&self.client, &self.session_id, &down).await?;
+        let up = input::DispatchMouseEventParams {
+            type_: "mouseReleased".to_string(),
+            buttons: Some(0),
+            ..down
+        };
+        input::dispatch_mouse_event(&self.client, &self.session_id, &up).await?;
+        self.post_action_settle(Duration::from_millis(300)).await?;
+        self.refresh_title_url().await;
+        self.rebuild_tree().await
+    }
+
+    /// `drag_and_drop(source_id, target_id)`: smooth pointer drag from source to target -> rebuild.
+    pub async fn drag_and_drop(
+        &mut self,
+        source_id: u32,
+        target_id: u32,
+    ) -> Result<String, CoreError> {
+        if !self.action_map.contains_key(&target_id) {
+            return Err(CoreError::ActionNotFound(target_id));
+        }
+        let (sx, sy) = self.resolve_action_center(source_id).await?;
+        input::dispatch_mouse_event(
+            &self.client,
+            &self.session_id,
+            &input::DispatchMouseEventParams {
+                type_: "mouseMoved".to_string(),
+                x: sx,
+                y: sy,
+                button: None,
+                buttons: None,
+                click_count: None,
+                delta_x: None,
+                delta_y: None,
+                modifiers: None,
+            },
+        )
+        .await?;
+        input::dispatch_mouse_event(
+            &self.client,
+            &self.session_id,
+            &input::DispatchMouseEventParams {
+                type_: "mousePressed".to_string(),
+                x: sx,
+                y: sy,
+                button: Some("left".to_string()),
+                buttons: Some(1),
+                click_count: Some(1),
+                delta_x: None,
+                delta_y: None,
+                modifiers: None,
+            },
+        )
+        .await?;
+        // Resolve target after mousePressed so scrolling target into view cannot shift source before grab.
+        let (tx, ty) = self.resolve_action_center(target_id).await?;
+        const STEPS: usize = 8;
+        for step in 1..=STEPS {
+            let t = step as f64 / STEPS as f64;
+            let x = sx + (tx - sx) * t;
+            let y = sy + (ty - sy) * t;
+            input::dispatch_mouse_event(
+                &self.client,
+                &self.session_id,
+                &input::DispatchMouseEventParams {
+                    type_: "mouseMoved".to_string(),
+                    x,
+                    y,
+                    button: Some("left".to_string()),
+                    buttons: Some(1),
+                    click_count: None,
+                    delta_x: None,
+                    delta_y: None,
+                    modifiers: None,
+                },
+            )
+            .await?;
+        }
+        input::dispatch_mouse_event(
+            &self.client,
+            &self.session_id,
+            &input::DispatchMouseEventParams {
+                type_: "mouseReleased".to_string(),
+                x: tx,
+                y: ty,
+                button: Some("left".to_string()),
+                buttons: Some(0),
+                click_count: Some(1),
+                delta_x: None,
+                delta_y: None,
+                modifiers: None,
+            },
+        )
+        .await?;
+        self.post_action_settle(Duration::from_millis(300)).await?;
+        self.refresh_title_url().await;
+        self.rebuild_tree().await
+    }
+
+    /// `scroll(direction, amount_px)`: synthetic `mouseWheel` -> rebuild.
     pub async fn scroll(
         &mut self,
         direction: ScrollDirection,
         amount: f64,
     ) -> Result<String, CoreError> {
+        self.scroll_at(None, direction, amount).await
+    }
+
+    /// Scroll at a specific element's center (for inner scrollable containers) or viewport center.
+    pub async fn scroll_at(
+        &mut self,
+        action_id: Option<u32>,
+        direction: ScrollDirection,
+        amount: f64,
+    ) -> Result<String, CoreError> {
+        let (x, y) = match action_id {
+            Some(id) if id > 0 => self.resolve_action_center(id).await?,
+            _ => (640.0, 400.0),
+        };
         let (dx, dy) = direction.delta(amount);
         input::dispatch_mouse_event(
             &self.client,
             &self.session_id,
             &input::DispatchMouseEventParams {
                 type_: "mouseWheel".to_string(),
-                x: 640.0,
-                y: 400.0,
+                x,
+                y,
                 button: None,
+                buttons: None,
                 click_count: None,
                 delta_x: Some(dx),
                 delta_y: Some(dy),
@@ -1900,7 +2532,7 @@ impl BrowserSession {
             },
         )
         .await?;
-        self.post_action_settle(Duration::from_millis(300)).await;
+        self.post_action_settle(Duration::from_millis(300)).await?;
         self.rebuild_tree().await
     }
 
@@ -1939,38 +2571,278 @@ impl BrowserSession {
         if !outcome.starts_with("ok:") {
             tracing::warn!(action_id, text, outcome, "select failed");
         }
-        self.post_action_settle(Duration::from_millis(200)).await;
+        self.post_action_settle(Duration::from_millis(200)).await?;
         self.rebuild_tree().await
     }
 
-    /// `press_key(key)`: single key down+up -> rebuild.
-    ///
-    /// Accepts named keys ("Enter", "ArrowDown", "Escape") and single
-    /// characters ("a", "7"). The DOM `code` is derived correctly
-    /// ("a" -> "KeyA").
+    /// `press_key(key)`: single key or modifier chord (e.g. `"Control+K"`, `"Shift+Tab"`) -> rebuild.
     pub async fn press_key(&mut self, key: &str) -> Result<String, CoreError> {
-        let spec = crate::actions::keys::resolve(key)
+        let chord = crate::actions::keys::resolve_chord(key)
             .ok_or_else(|| CoreError::InvalidScrollDirection(format!("unsupported key: {key}")))?;
+        for m in &chord.modifier_specs {
+            input::dispatch_key_event(
+                &self.client,
+                &self.session_id,
+                &input::DispatchKeyEventParams {
+                    type_: "rawKeyDown".to_string(),
+                    key: m.key.clone(),
+                    code: Some(m.code.clone()),
+                    modifiers: Some(chord.modifiers),
+                    windows_virtual_key_code: m.vk,
+                    native_virtual_key_code: None,
+                },
+            )
+            .await?;
+        }
         let params = input::DispatchKeyEventParams {
             type_: "keyDown".to_string(),
-            key: spec.key.clone(),
-            code: Some(spec.code.clone()),
-            modifiers: None,
-            windows_virtual_key_code: spec.vk,
+            key: chord.key.key.clone(),
+            code: Some(chord.key.code.clone()),
+            modifiers: (chord.modifiers != 0).then_some(chord.modifiers),
+            windows_virtual_key_code: chord.key.vk,
             native_virtual_key_code: None,
         };
         input::dispatch_key_event(&self.client, &self.session_id, &params).await?;
         let mut up = params;
         up.type_ = "keyUp".to_string();
         input::dispatch_key_event(&self.client, &self.session_id, &up).await?;
-        self.post_action_settle(Duration::from_millis(250)).await;
+        for m in chord.modifier_specs.iter().rev() {
+            input::dispatch_key_event(
+                &self.client,
+                &self.session_id,
+                &input::DispatchKeyEventParams {
+                    type_: "keyUp".to_string(),
+                    key: m.key.clone(),
+                    code: Some(m.code.clone()),
+                    modifiers: Some(0),
+                    windows_virtual_key_code: m.vk,
+                    native_virtual_key_code: None,
+                },
+            )
+            .await?;
+        }
+        self.post_action_settle(Duration::from_millis(250)).await?;
         self.refresh_title_url().await;
         self.rebuild_tree().await
+    }
+
+    /// Navigate back one entry in session history and return the refreshed tree.
+    pub async fn back(&mut self) -> Result<String, CoreError> {
+        let hist = page::get_navigation_history(&self.client, &self.session_id).await?;
+        let target = adjacent_history_entry(&hist, -1)
+            .ok_or_else(|| CoreError::NavigationFailed("no previous history entry".to_string()))?;
+        self.net.reset();
+        page::navigate_to_history_entry(&self.client, &self.session_id, target.id).await?;
+        self.settle_after_history_nav().await
+    }
+
+    /// Navigate forward one entry in session history and return the refreshed tree.
+    pub async fn forward(&mut self) -> Result<String, CoreError> {
+        let hist = page::get_navigation_history(&self.client, &self.session_id).await?;
+        let target = adjacent_history_entry(&hist, 1)
+            .ok_or_else(|| CoreError::NavigationFailed("no next history entry".to_string()))?;
+        self.net.reset();
+        page::navigate_to_history_entry(&self.client, &self.session_id, target.id).await?;
+        self.settle_after_history_nav().await
+    }
+
+    /// Reload the current page and return the refreshed tree.
+    pub async fn reload(&mut self, ignore_cache: bool) -> Result<String, CoreError> {
+        self.net.reset();
+        page::reload(&self.client, &self.session_id, ignore_cache).await?;
+        self.settle_after_history_nav().await
+    }
+
+    async fn settle_after_history_nav(&mut self) -> Result<String, CoreError> {
+        flashbrowse_cdp::runtime::run(self.settle_after_history_nav_inner()).await?
+    }
+
+    async fn settle_after_history_nav_inner(&mut self) -> Result<String, CoreError> {
+        // Brief grace period so Chrome begins transitioning out of the old document.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        self.wait_for_popup_settle().await?;
+        self.refresh_title_url().await;
+        if self.url.starts_with("chrome-error://") {
+            self.invalidate_tree();
+            return Err(CoreError::NavigationFailed(self.url.clone()));
+        }
+        self.rebuild_tree().await
+    }
+
+    /// Wait until `condition` holds or `timeout_ms` elapses (capped 100..=30_000 ms),
+    /// then return the refreshed semantic tree.
+    pub async fn wait_for(
+        &mut self,
+        condition: WaitCondition,
+        timeout_ms: u64,
+    ) -> Result<String, CoreError> {
+        flashbrowse_cdp::runtime::run(self.wait_for_inner(condition, timeout_ms)).await?
+    }
+
+    async fn wait_for_inner(
+        &mut self,
+        condition: WaitCondition,
+        timeout_ms: u64,
+    ) -> Result<String, CoreError> {
+        let clamped = timeout_ms.clamp(100, 30_000);
+        let deadline = {
+            let now = tokio::time::Instant::now();
+            now.checked_add(Duration::from_millis(clamped))
+                .unwrap_or(now)
+        };
+        loop {
+            let matched = match &condition {
+                WaitCondition::Text(needle) => {
+                    let needle_js = serde_json::to_string(needle)?;
+                    let expr = format!(
+                        r#"(() => {{
+  const want = {needle_js};
+  const pending = [document];
+  while (pending.length) {{
+    const root = pending.pop();
+    if (root === document && document.body && (document.body.innerText || '').includes(want)) return true;
+    if (root instanceof ShadowRoot && (root.textContent || '').includes(want)) return true;
+    for (const el of root.querySelectorAll('*')) {{
+      if (el.shadowRoot) pending.push(el.shadowRoot);
+    }}
+  }}
+  return false;
+}})()"#
+                    );
+                    self.driver
+                        .evaluate(&expr)
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                }
+                WaitCondition::Selector(selector) => {
+                    let sel_js = serde_json::to_string(selector)?;
+                    let expr = format!(
+                        r#"(() => {{
+  const sel = {sel_js};
+  const pending = [document];
+  while (pending.length) {{
+    const root = pending.pop();
+    try {{ if (root.querySelector(sel)) return true; }} catch (_) {{ return false; }}
+    for (const el of root.querySelectorAll('*')) {{
+      if (el.shadowRoot) pending.push(el.shadowRoot);
+    }}
+  }}
+  return false;
+}})()"#
+                    );
+                    self.driver
+                        .evaluate(&expr)
+                        .await
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                }
+                WaitCondition::UrlContains(part) => self
+                    .driver
+                    .evaluate("location.href")
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.contains(part.as_str())))
+                    .unwrap_or(false),
+                WaitCondition::NetworkIdle { quiet_ms } => self.net.idle(*quiet_ms),
+            };
+            if matched {
+                self.refresh_title_url().await;
+                return self.rebuild_tree().await;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CoreError::NavigationFailed(format!(
+                    "wait_for timed out after {clamped}ms"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Captured console messages and uncaught page exceptions (bounded to 200 entries).
+    pub fn console_entries(&self, level: Option<&str>) -> Vec<ConsoleEntry> {
+        self.console.list(level)
+    }
+
+    /// Clear captured console entries.
+    pub fn clear_console(&self) {
+        self.console.clear();
+    }
+
+    /// Captured network request/response entries (bounded to 200 entries).
+    pub fn network_entries(&self, failed_only: bool) -> Vec<NetworkEntry> {
+        self.network_log.list(failed_only)
+    }
+
+    /// Fetch the response body for a captured `request_id` (capped at 64 KiB text).
+    pub async fn network_response_body(&self, request_id: &str) -> Result<String, CoreError> {
+        let resp = network::get_response_body(&self.client, &self.session_id, request_id).await?;
+        let text = if resp.base64_encoded {
+            match flashbrowse_cdp::protocol::fetch::decode_base64(&resp.body) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(_) => resp.body,
+            }
+        } else {
+            resp.body
+        };
+        const MAX_BODY_BYTES: usize = 64 * 1024;
+        if text.len() > MAX_BODY_BYTES {
+            let end = text.floor_char_boundary(MAX_BODY_BYTES);
+            Ok(format!(
+                "{}...(truncated)",
+                text.get(..end).unwrap_or_default()
+            ))
+        } else {
+            Ok(text)
+        }
+    }
+
+    /// Clear captured network log entries.
+    pub fn clear_network(&self) {
+        self.network_log.clear();
+    }
+
+    /// Set extra HTTP headers sent on every subsequent request in this session.
+    pub async fn set_extra_headers(
+        &mut self,
+        headers: HashMap<String, String>,
+    ) -> Result<(), CoreError> {
+        network::set_extra_http_headers(&self.client, &self.session_id, &headers).await?;
+        self.extra_headers = headers;
+        Ok(())
+    }
+
+    /// Add a lazy `Fetch` route mock or abort rule.
+    pub async fn add_route(&self, rule: RouteRule) -> Result<(), CoreError> {
+        self.routes
+            .add_rule(&self.client, &self.session_id, rule)
+            .await?;
+        Ok(())
+    }
+
+    /// List active `Fetch` route rules.
+    pub fn list_routes(&self) -> Vec<RouteRule> {
+        self.routes.list_rules()
+    }
+
+    /// Clear all active `Fetch` route rules and disable `Fetch` interception.
+    pub async fn clear_routes(&self) -> Result<(), CoreError> {
+        self.routes
+            .clear_rules(&self.client, &self.session_id)
+            .await?;
+        Ok(())
     }
 
     /// Extract clean Markdown (boss-level `browser_extract_markdown`).
     pub async fn extract_markdown(&self) -> Result<String, CoreError> {
         let resp = runtime::evaluate(&self.client, &self.session_id, EXTRACT_SCRIPT).await?;
+        if let Some(details) = resp.exception_details {
+            return Err(CoreError::NavigationFailed(format!(
+                "page extraction failed: {details}"
+            )));
+        }
         if let Some(v) = resp.result.value {
             match v {
                 Value::String(s) => return Ok(s),
@@ -1998,6 +2870,20 @@ impl BrowserSession {
     /// [`Self::reload_blocked_images`]), which is what actually makes pixels
     /// appear.
     pub async fn screenshot(&self, opts: ScreenshotOptions) -> Result<String, CoreError> {
+        flashbrowse_cdp::runtime::run(self.screenshot_inner(opts)).await?
+    }
+
+    async fn screenshot_inner(&self, opts: ScreenshotOptions) -> Result<String, CoreError> {
+        // Validate action_id before lifting resource blocks or mutating page state.
+        if let Some(action_id) = opts.action_id {
+            if !self.action_map.contains_key(&action_id) {
+                return Err(CoreError::ActionNotFound(action_id));
+            }
+        }
+        let mut guard = ScreenshotGuard {
+            client: &self.client,
+            armed: true,
+        };
         let needs_lift = self.resource_policy != ResourcePolicy::FullRender;
         if needs_lift {
             self.driver
@@ -2008,20 +2894,154 @@ impl BrowserSession {
         // this the capture shows broken-image glyphs, no matter how long we
         // wait for them.
         if needs_lift {
-            self.reload_blocked_images().await;
+            self.reload_blocked_images().await?;
         }
-        if opts.prepare_lazy_content {
+        if opts.prepare_lazy_content && opts.action_id.is_none() {
             self.prepare_lazy_content_for_screenshot(opts.full_page)
-                .await;
+                .await?;
         }
-        self.wait_for_visual_ready(opts.timeout_ms).await;
-        let data = self.driver.capture_screenshot(opts.full_page).await?;
+        self.wait_for_visual_ready(opts.timeout_ms).await?;
+        let capture_res = async {
+            let clip = if let Some(action_id) = opts.action_id {
+                let backend = *self
+                    .action_map
+                    .get(&action_id)
+                    .ok_or(CoreError::ActionNotFound(action_id))?;
+                let (dom_sid, owner) = self.frame_for_action(action_id);
+                let _ = dom::scroll_into_view_if_needed(&self.client, &dom_sid, backend).await;
+                let resp = dom::get_box_model(&self.client, &dom_sid, backend).await?;
+                let quad = if resp.model.border.len() >= 8 {
+                    &resp.model.border
+                } else {
+                    &resp.model.content
+                };
+                let [x1, y1, x2, y2, x3, y3, x4, y4, ..] = quad.as_slice() else {
+                    return Err(CoreError::NoBoxModel(action_id));
+                };
+                let (ox, oy) = self.frame_offset(owner).await;
+                let xs = [*x1, *x2, *x3, *x4];
+                let ys = [*y1, *y2, *y3, *y4];
+                let min_x = xs.into_iter().fold(f64::INFINITY, f64::min) + ox;
+                let max_x = xs.into_iter().fold(f64::NEG_INFINITY, f64::max) + ox;
+                let min_y = ys.into_iter().fold(f64::INFINITY, f64::min) + oy;
+                let max_y = ys.into_iter().fold(f64::NEG_INFINITY, f64::max) + oy;
+                let width = (max_x - min_x).max(1.0);
+                let height = (max_y - min_y).max(1.0);
+                Some(page::Viewport {
+                    x: min_x.max(0.0),
+                    y: min_y.max(0.0),
+                    width,
+                    height,
+                    scale: 1.0,
+                })
+            } else {
+                None
+            };
+            self.driver
+                .capture_screenshot_clipped(opts.full_page && clip.is_none(), clip)
+                .await
+        }
+        .await;
         if needs_lift {
             self.driver
                 .set_resource_policy(self.resource_policy)
                 .await?;
         }
-        Ok(data)
+        guard.armed = false;
+        capture_res
+    }
+
+    /// Apply viewport, timezone, locale, and/or geolocation emulation overrides.
+    pub async fn emulate(&self, opts: EmulationOptions) -> Result<(), CoreError> {
+        if let Some(vp) = opts.viewport {
+            emulation::set_device_metrics_override(
+                &self.client,
+                &self.session_id,
+                &emulation::DeviceMetricsParams {
+                    width: vp.width,
+                    height: vp.height,
+                    device_scale_factor: vp.device_scale_factor,
+                    mobile: vp.mobile,
+                },
+            )
+            .await?;
+        }
+        if let Some(tz) = opts.timezone {
+            emulation::set_timezone_override(&self.client, &self.session_id, &tz).await?;
+        }
+        if let Some(loc) = opts.locale {
+            emulation::set_locale_override(&self.client, &self.session_id, &loc).await?;
+        }
+        if let Some(geo) = opts.geolocation {
+            emulation::set_geolocation_override(
+                &self.client,
+                &self.session_id,
+                geo.latitude,
+                geo.longitude,
+                geo.accuracy,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Clear device metrics, timezone, locale, geolocation, and permission overrides.
+    pub async fn reset_emulation(&self) -> Result<(), CoreError> {
+        let mut first_err: Option<CoreError> = None;
+        let mut remember = |result: Result<(), CdpError>| {
+            if let Err(err) = result {
+                first_err.get_or_insert(err.into());
+            }
+        };
+        remember(emulation::clear_device_metrics_override(&self.client, &self.session_id).await);
+        remember(emulation::set_timezone_override(&self.client, &self.session_id, "").await);
+        remember(emulation::set_locale_override(&self.client, &self.session_id, "").await);
+        remember(emulation::clear_geolocation_override(&self.client, &self.session_id).await);
+        remember(
+            browser::reset_permissions(&self.client, self.browser_context_id.as_deref()).await,
+        );
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Grant browser permissions (e.g. `geolocation`, `notifications`, `clipboardReadWrite`).
+    pub async fn grant_permissions(
+        &self,
+        origin: Option<&str>,
+        permissions: &[String],
+    ) -> Result<(), CoreError> {
+        browser::grant_permissions(
+            &self.client,
+            origin,
+            permissions,
+            self.browser_context_id.as_deref(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Render the current page to PDF bytes via `Page.printToPDF`.
+    pub async fn print_to_pdf(&self, opts: PdfOptions) -> Result<Vec<u8>, CoreError> {
+        let safe_scale = if opts.scale.is_finite() {
+            opts.scale.clamp(0.1, 2.0)
+        } else {
+            1.0
+        };
+        let resp = page::print_to_pdf(
+            &self.client,
+            &self.session_id,
+            &page::PrintToPdfParams {
+                landscape: Some(opts.landscape),
+                print_background: Some(opts.print_background),
+                scale: Some(safe_scale),
+                paper_width: None,
+                paper_height: None,
+            },
+        )
+        .await?;
+        fetch::decode_base64(&resp.data).map_err(CoreError::NavigationFailed)
     }
 
     /// Convenience wrapper (viewport, default prepare/timeout).
@@ -2039,7 +3059,7 @@ impl BrowserSession {
     /// Images that already loaded are left alone (`complete && naturalWidth`),
     /// so this never re-fetches a working image. Inline `data:` URIs are
     /// never blocked, so they are skipped too.
-    async fn reload_blocked_images(&self) {
+    async fn reload_blocked_images(&self) -> Result<(), CoreError> {
         // Bounded: a pathological page with thousands of images must not
         // turn one screenshot into thousands of requests.
         const MAX_RETRY: usize = 200;
@@ -2066,12 +3086,13 @@ impl BrowserSession {
   return n;
 }})()"#
         );
-        if let Ok(Value::Number(n)) = self.driver.evaluate(&expr).await {
+        if let Value::Number(n) = self.driver.evaluate(&expr).await? {
             let count = n.as_u64().unwrap_or(0);
             if count > 0 {
                 tracing::debug!(count, "re-requested blocked images");
             }
         }
+        Ok(())
     }
 
     /// Surface lazy-loaded content before a capture.
@@ -2081,30 +3102,47 @@ impl BrowserSession {
     /// restore matters: the agent asked for a picture of what it is currently
     /// looking at, so snapping the viewport back to the top would destroy
     /// that context.
-    async fn prepare_lazy_content_for_screenshot(&self, full_page: bool) {
+    async fn prepare_lazy_content_for_screenshot(&self, full_page: bool) -> Result<(), CoreError> {
         // Remember where the agent was. The value is held here (not on
         // `window`) so nothing is left behind in the page's global scope.
-        let saved_y = self.evaluate_scroll_y().await;
-        let script = r#"(function(){
+        let saved_y = self
+            .driver
+            .evaluate("window.scrollY")
+            .await?
+            .as_f64()
+            .ok_or_else(|| {
+                CoreError::NavigationFailed("could not read the page scroll position".to_string())
+            })?;
+        let target = if full_page { 0.0 } else { saved_y };
+        let script = format!(
+            r#"(function(){{
+  try {{
   const h = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
   const step = Math.max(400, window.innerHeight);
-  for (let y = 0; y < h; y += step) { window.scrollTo(0, y); }
+  for (let y = 0; y < h; y += step) {{ window.scrollTo(0, y); }}
   return true;
-})()"#;
-        let _ = self.driver.evaluate(script).await;
-        // Give the lazy loader a tick to start the fetches.
+  }} finally {{
+    const key = Symbol.for('flashbrowse.screenshot.scroll.restore');
+    window[key] = setTimeout(() => {{ delete window[key]; window.scrollTo(0, {target}); }}, 150);
+  }}
+}})()"#
+        );
+        self.driver.evaluate(&script).await?;
+        // Let the page restore its viewport before preparing the capture.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        // Restore the agent's viewport.
-        let target = if full_page { 0.0 } else { saved_y };
-        let _ = self
-            .driver
-            .evaluate(&format!("window.scrollTo(0, {target}); true"))
-            .await;
+        self.driver
+            .evaluate(&format!("(() => {{ const key = Symbol.for('flashbrowse.screenshot.scroll.restore'); clearTimeout(window[key]); delete window[key]; window.scrollTo(0, {target}); return true; }})()"))
+            .await?;
+        Ok(())
     }
 
-    async fn wait_for_visual_ready(&self, timeout_ms: u64) {
+    async fn wait_for_visual_ready(&self, timeout_ms: u64) -> Result<(), CoreError> {
         let budget = timeout_ms.clamp(500, SCREENSHOT_PREPARE_MS_MAX);
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(budget);
+        let deadline = {
+            let now = tokio::time::Instant::now();
+            now.checked_add(Duration::from_millis(budget))
+                .unwrap_or(now)
+        };
         let quiet_ms = 350u64;
         loop {
             if tokio::time::Instant::now() >= deadline {
@@ -2112,12 +3150,13 @@ impl BrowserSession {
                 break;
             }
             let net_idle = self.net.idle(quiet_ms);
-            let images_ok = self.images_ready().await;
+            let images_ok = self.images_ready().await?;
             if net_idle && images_ok {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Ok(())
     }
 
     /// True when no image is still pending.
@@ -2127,7 +3166,7 @@ impl BrowserSession {
     /// permanently broken image (blocked, 404, unsupported format) keeps the
     /// wait loop spinning until the deadline - every screenshot of a page with
     /// one bad image would cost the full timeout.
-    async fn images_ready(&self) -> bool {
+    async fn images_ready(&self) -> Result<bool, CoreError> {
         let expr = r#"(function(){
   const imgs = Array.from(document.images || []);
   if (imgs.length === 0) return true;
@@ -2136,10 +3175,9 @@ impl BrowserSession {
     return img.complete;
   });
 })()"#;
-        match self.driver.evaluate(expr).await {
-            Ok(Value::Bool(b)) => b,
-            _ => true,
-        }
+        self.driver.evaluate(expr).await?.as_bool().ok_or_else(|| {
+            CoreError::NavigationFailed("could not check image readiness".to_string())
+        })
     }
 
     /// `Title`/`URL` header fields via in-page evaluation (best-effort).
@@ -2162,8 +3200,16 @@ impl BrowserSession {
 
     /// Wait for post-action page activity (in-flight network + DOM stability)
     /// instead of a hardcoded sleep.
-    async fn post_action_settle(&self, max_wait: Duration) {
-        let deadline = tokio::time::Instant::now() + max_wait;
+    async fn post_action_settle(&self, max_wait: Duration) -> Result<(), CoreError> {
+        flashbrowse_cdp::runtime::run(self.post_action_settle_inner(max_wait)).await?;
+        Ok(())
+    }
+
+    async fn post_action_settle_inner(&self, max_wait: Duration) {
+        let deadline = {
+            let now = tokio::time::Instant::now();
+            now.checked_add(max_wait).unwrap_or(now)
+        };
         let mut prev_state: Option<String> = None;
         loop {
             let state = self
@@ -2193,9 +3239,21 @@ impl BrowserSession {
         dom_session_id: &str,
         backend: i64,
     ) -> Result<(f64, f64), CoreError> {
+        flashbrowse_cdp::runtime::run(self.wait_for_actionable_inner(dom_session_id, backend))
+            .await?
+    }
+
+    async fn wait_for_actionable_inner(
+        &self,
+        dom_session_id: &str,
+        backend: i64,
+    ) -> Result<(f64, f64), CoreError> {
         let mut prev: Option<(f64, f64)> = None;
         let mut stable_count = 0u8;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = {
+            let now = tokio::time::Instant::now();
+            now.checked_add(Duration::from_secs(5)).unwrap_or(now)
+        };
         loop {
             if let Err(e) =
                 dom::scroll_into_view_if_needed(&self.client, dom_session_id, backend).await
@@ -2224,7 +3282,7 @@ impl BrowserSession {
                 && resp.model.height > 0.0;
             if visible {
                 if prev == Some(center) {
-                    stable_count += 1;
+                    stable_count = stable_count.saturating_add(1);
                     if stable_count >= 1 {
                         return Ok(center);
                     }
@@ -2262,6 +3320,7 @@ impl BrowserSession {
                     x,
                     y,
                     button: Some("left".to_string()),
+                    buttons: None,
                     click_count: Some(1),
                     delta_x: None,
                     delta_y: None,
@@ -2274,13 +3333,46 @@ impl BrowserSession {
     }
 
     /// Drain pending RPCs, kill Chromium (if owned), drop profile dir.
-    /// Attached sessions (session-file mode) only disconnect.
+    /// Isolated context sessions dispose their browserContextId without shutting
+    /// down the shared `CdpClient`. Attached sessions only disconnect.
     pub async fn shutdown(mut self) {
+        if self.chrome.is_none() {
+            if let Some(cid) = self.browser_context_id.take() {
+                let mut cleanup = BrowserContextCleanup::new(self.client.clone(), cid);
+                if let Err(error) = cleanup.dispose().await {
+                    tracing::warn!(%error, "isolated browser context disposal failed; scheduling a retry");
+                }
+                return;
+            }
+        }
         self.client.shutdown();
         if let Some(mut proc) = self.chrome.take() {
             proc.shutdown().await;
         }
     }
+
+    /// Close an isolated context and report a CDP disposal failure to its caller.
+    /// If disposal fails, the cleanup guard schedules a best-effort retry.
+    pub async fn close_isolated_context(mut self) -> Result<(), CoreError> {
+        let Some(browser_context_id) = self.browser_context_id.take() else {
+            self.shutdown().await;
+            return Ok(());
+        };
+        let mut cleanup = BrowserContextCleanup::new(self.client.clone(), browser_context_id);
+        cleanup.dispose().await?;
+        Ok(())
+    }
+}
+
+fn adjacent_history_entry(
+    history: &page::GetNavigationHistoryResponse,
+    offset: isize,
+) -> Option<&page::NavigationEntry> {
+    if history.current_index >= history.entries.len() {
+        return None;
+    }
+    let index = history.current_index.checked_add_signed(offset)?;
+    history.entries.get(index)
 }
 
 /// Metadata emitted by [`BrowserSession::detach`] for `close`/`act` files.
@@ -2337,6 +3429,14 @@ fn build_action_sessions(
     out
 }
 
+// The SHA-256 schedule uses a fixed 64-word block. Initialization writes
+// at most 16 words, each expansion index is in 16..64, and both round arrays
+// have exactly 64 entries.
+#[expect(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "fixed SHA-256 schedule bounds"
+)]
 fn sha256_hex(input: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -2369,8 +3469,9 @@ fn sha256_hex(input: &[u8]) -> String {
     ];
     for chunk in data.chunks(64) {
         let mut w = [0u32; 64];
-        for (i, bytes) in chunk.chunks(4).take(16).enumerate() {
-            w[i] = u32::from_be_bytes(bytes.try_into().expect("four-byte word"));
+        let (words, _) = chunk.as_chunks::<4>();
+        for (i, bytes) in words.iter().take(16).enumerate() {
+            w[i] = u32::from_be_bytes(*bytes);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -2410,12 +3511,188 @@ fn sha256_hex(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod settle_shadow_tests {
+    use std::time::{Duration, Instant};
+
+    use super::{target, BrowserContextCleanup, BrowserSession, SessionConfig};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn screenshot_guard_disconnects_the_client_during_unwind() {
+        use super::ScreenshotGuard;
+        use tokio::io::duplex;
+
+        let (client_rx, _peer_tx) = duplex(16);
+        let (_peer_rx, client_tx) = duplex(16);
+        let client = flashbrowse_cdp::CdpClient::connect_pipe(client_rx, client_tx)
+            .await
+            .expect("create an in-memory CDP client");
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ScreenshotGuard {
+                client: &client,
+                armed: true,
+            };
+            panic!("simulate a screenshot preparation panic");
+        }));
+
+        assert!(panic.is_err());
+        assert!(
+            !client.is_connected(),
+            "a partially prepared screenshot must invalidate its CDP session"
+        );
+    }
+
+    #[test]
+    fn malformed_history_index_cannot_overflow() {
+        let history = super::page::GetNavigationHistoryResponse {
+            current_index: usize::MAX,
+            entries: Vec::new(),
+        };
+        assert!(super::adjacent_history_entry(&history, 1).is_none());
+        assert!(super::adjacent_history_entry(&history, -1).is_none());
+    }
+
     #[test]
     fn sha256_matches_standard_vector() {
         assert_eq!(
             super::sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[tokio::test]
+    async fn dropped_browser_context_guard_schedules_context_disposal() {
+        if flashbrowse_cdp::find_chrome(None).is_err() {
+            return;
+        }
+        let session = match BrowserSession::launch(SessionConfig {
+            no_sandbox: Some(true),
+            ..SessionConfig::default()
+        })
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("SKIP: Chrome could not launch for context cleanup test: {error}");
+                return;
+            }
+        };
+        let client = session.client();
+        let browser_context_id = super::target::create_browser_context(&client)
+            .await
+            .expect("create isolated browser context");
+        let target_id = super::target::create_target_in_context(
+            &client,
+            "about:blank",
+            Some(&browser_context_id),
+        )
+        .await
+        .expect("create page in isolated context")
+        .target_id;
+
+        drop(BrowserContextCleanup::new(
+            client.clone(),
+            browser_context_id,
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut disposed = false;
+        while Instant::now() < deadline {
+            let targets = super::target::get_targets(&client)
+                .await
+                .expect("list Chrome targets");
+            if !targets
+                .target_infos
+                .iter()
+                .any(|target| target.target_id == target_id)
+            {
+                disposed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        session.shutdown().await;
+        assert!(disposed, "dropping the guard should dispose its context");
+    }
+
+    #[tokio::test]
+    async fn externally_closed_active_page_recovers_inside_its_browser_context() {
+        if flashbrowse_cdp::find_chrome(None).is_err() {
+            return;
+        }
+        let config = SessionConfig {
+            no_sandbox: Some(true),
+            ..SessionConfig::default()
+        };
+        let default_session = match BrowserSession::launch(config.clone()).await {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("SKIP: Chrome could not launch for tab recovery test: {error}");
+                return;
+            }
+        };
+        let mut isolated = default_session
+            .create_isolated_context(&config)
+            .await
+            .expect("create isolated context");
+        let isolated_context = isolated
+            .browser_context_id()
+            .expect("isolated context id")
+            .to_string();
+        let closed_target = isolated.target_id().to_string();
+        let isolated_client = isolated.client();
+
+        assert!(target::close_target(&isolated_client, &closed_target)
+            .await
+            .expect("close active target externally"));
+        let close_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < close_deadline {
+            let tabs = isolated.list_tabs().await.expect("list isolated tabs");
+            if !tabs.iter().any(|tab| tab.target_id == closed_target) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let tabs = isolated
+            .recover_closed_active_tab(&config)
+            .await
+            .expect("recover active tab");
+        assert_ne!(isolated.target_id(), closed_target);
+        assert!(tabs.iter().any(|tab| tab.target_id == isolated.target_id()));
+        assert!(tabs
+            .iter()
+            .all(|tab| tab.browser_context_id.as_deref() == Some(&isolated_context)));
+        assert_eq!(
+            isolated.browser_context_id(),
+            Some(isolated_context.as_str())
+        );
+
+        let tree = isolated
+            .open("data:text/html,%3Ctitle%3ERecovered%3C/title%3E%3Ch1%3EIsolated%20Recovery%3C/h1%3E")
+            .await
+            .expect("open after external tab closure");
+        assert!(tree.contains("Isolated Recovery"));
+        let default_tabs = default_session
+            .list_tabs()
+            .await
+            .expect("list default context tabs");
+        let all_targets = target::get_targets(&default_session.client())
+            .await
+            .expect("list all browser targets");
+        assert!(
+            !default_tabs.is_empty(),
+            "default context tabs: {default_tabs:?}; all targets: {:?}",
+            all_targets.target_infos
+        );
+        assert!(default_tabs.iter().all(|tab| {
+            tab.browser_context_id.as_deref() == default_session.target_context_id.as_deref()
+        }));
+
+        isolated
+            .close_isolated_context()
+            .await
+            .expect("close context");
+        default_session.shutdown().await;
     }
 }
 
@@ -2435,6 +3712,7 @@ mod popup_tracker_tests {
             url: format!("https://example.com/{id}"),
             title: id.to_string(),
             opener_id: opener.map(str::to_string),
+            browser_context_id: None,
         }
     }
 

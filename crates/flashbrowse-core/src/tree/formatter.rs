@@ -32,7 +32,7 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
     if max_chars == 1 {
         return "…".to_string();
     }
-    let mut out: String = s.chars().take(max_chars - 1).collect();
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
     out.push('…');
     out
 }
@@ -44,22 +44,20 @@ fn truncate(s: &str) -> String {
 /// Extract `[N]` action references from a cell string.
 fn extract_action_refs(cell: &str) -> Vec<&str> {
     let mut refs = Vec::new();
-    let bytes = cell.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'[' {
-            let start = i + 1;
-            let mut j = start;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
+    let mut tail = cell;
+    while let Some((_, rest)) = tail.split_once('[') {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let after_digits = rest.get(digits..).unwrap_or_default();
+        if let Some(after_ref) = after_digits.strip_prefix(']').filter(|_| digits > 0) {
+            let start = cell.len().saturating_sub(rest.len()).saturating_sub(1);
+            let end = cell.len().saturating_sub(after_ref.len());
+            if let Some(reference) = cell.get(start..end) {
+                refs.push(reference);
             }
-            if j > start && j < bytes.len() && bytes[j] == b']' {
-                refs.push(&cell[i..=j]);
-                i = j + 1;
-                continue;
-            }
+            tail = after_ref;
+        } else {
+            tail = rest;
         }
-        i += 1;
     }
     refs
 }
@@ -75,7 +73,7 @@ fn truncate_cell_keeping_refs(cell: &str, budget: usize) -> String {
     }
     let ref_tail = refs.join(" ");
     let tail_len = ref_tail.chars().count();
-    let prefix_budget = budget.saturating_sub(tail_len + 1);
+    let prefix_budget = budget.saturating_sub(tail_len.saturating_add(1));
     if prefix_budget < 2 {
         return ref_tail;
     }
@@ -93,7 +91,7 @@ fn truncate_row(s: &str) -> String {
         return truncate_cell_keeping_refs(s, MAX_NAME_CHARS);
     }
 
-    let sep_chars = (cells.len() - 1) * 3;
+    let sep_chars = cells.len().saturating_sub(1).saturating_mul(3);
     let mut alloc = vec![0usize; cells.len()];
     let mut flex: Vec<(usize, usize)> = Vec::new();
     let mut used = sep_chars;
@@ -104,8 +102,10 @@ fn truncate_row(s: &str) -> String {
         // Short ref-bearing cells (like `[1]` or `[1] [2]`) are protected in full
         // so action links on the row are never truncated away.
         if has_refs && len <= 24 {
-            alloc[i] = len;
-            used += len;
+            if let Some(slot) = alloc.get_mut(i) {
+                *slot = len;
+            }
+            used = used.saturating_add(len);
         } else {
             flex.push((i, len));
         }
@@ -117,15 +117,17 @@ fn truncate_row(s: &str) -> String {
     for (i, len) in flex {
         let share = rem.checked_div(left).unwrap_or(0);
         let take = len.min(share);
-        alloc[i] = take;
+        if let Some(slot) = alloc.get_mut(i) {
+            *slot = take;
+        }
         rem = rem.saturating_sub(take);
-        left -= 1;
+        left = left.saturating_sub(1);
     }
 
     cells
         .iter()
-        .enumerate()
-        .map(|(i, &cell)| truncate_cell_keeping_refs(cell, alloc[i]))
+        .zip(alloc)
+        .map(|(&cell, budget)| truncate_cell_keeping_refs(cell, budget))
         .collect::<Vec<_>>()
         .join(" | ")
 }
@@ -209,7 +211,7 @@ pub fn render(title: &str, url: &str, nodes: &[SemanticNode]) -> String {
     out
 }
 
-/// Same content as [`render`], indented by [`SemanticNode::depth`].
+/// Same content as [`render`], indented by [`SemanticNode::depth`] up to 128 levels.
 pub fn render_nested(title: &str, url: &str, nodes: &[SemanticNode]) -> String {
     let mut out = String::new();
     out.push_str(&format!("Title: {}\n", title.trim()));
@@ -218,7 +220,9 @@ pub fn render_nested(title: &str, url: &str, nodes: &[SemanticNode]) -> String {
 
     for n in nodes {
         if let Some(line) = format_node(n) {
-            out.push_str(&"  ".repeat(n.depth));
+            for _ in 0..n.depth.min(128) {
+                out.push_str("  ");
+            }
             out.push_str(&line);
             out.push('\n');
         }
@@ -255,6 +259,16 @@ mod tests {
             node_id: "1".to_string(),
             depth: 0,
         }
+    }
+
+    #[test]
+    fn maximum_depth_keeps_visible_text_and_ids() {
+        let mut n = sn(Some(7), "button", "Kept");
+        n.depth = usize::MAX;
+        let rendered = render_nested("T", "u", &[n]);
+        let line = rendered.lines().last().expect("node line");
+        assert_eq!(line.len() - line.trim_start().len(), 256);
+        assert!(line.contains("[7] Button: \"Kept\""));
     }
 
     #[test]

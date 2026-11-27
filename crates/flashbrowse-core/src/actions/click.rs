@@ -5,11 +5,11 @@ use flashbrowse_cdp::protocol::dom::BoxModel;
 /// Center coordinate of a box `border` quad `[x1,y1,x2,y2,x3,y3,x4,y4]`.
 pub fn box_center(model: &BoxModel) -> Option<(f64, f64)> {
     let b = &model.border;
-    if b.len() < 8 {
+    let [x1, y1, x2, y2, x3, y3, x4, y4, ..] = b.as_slice() else {
         return None;
-    }
-    let x = (b[0] + b[2] + b[4] + b[6]) / 4.0;
-    let y = (b[1] + b[3] + b[5] + b[7]) / 4.0;
+    };
+    let x = (x1 + x2 + x3 + x4) / 4.0;
+    let y = (y1 + y2 + y3 + y4) / 4.0;
     if !x.is_finite() || !y.is_finite() {
         return None;
     }

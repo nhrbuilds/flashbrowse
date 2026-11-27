@@ -320,7 +320,7 @@ fn derive_name_with_sources<'a>(
     stack.reverse();
     let mut visited: usize = 0;
     while let Some(id) = stack.pop() {
-        visited += 1;
+        visited = visited.saturating_add(1);
         if visited > 64 {
             break;
         }
@@ -371,7 +371,7 @@ fn derive_name(
     stack.reverse();
     let mut visited: usize = 0;
     while let Some(id) = stack.pop() {
-        visited += 1;
+        visited = visited.saturating_add(1);
         if visited > 64 {
             break;
         }
@@ -480,7 +480,7 @@ fn collect_refs(
         if ACTIONABLE_ROLES.contains(&role) {
             if let Some(id) = id_of_node.get(*kid) {
                 parts.push(format!("[{id}]"));
-                *refs += 1;
+                *refs = refs.saturating_add(1);
             }
             // Do not descend: the link's own label is on its numbered line.
             continue;
@@ -500,7 +500,7 @@ fn collect_refs(
             id_of_node,
             parts,
             refs,
-            depth + 1,
+            depth.saturating_add(1),
         );
     }
 }
@@ -614,15 +614,58 @@ impl Default for CompressOptions {
     }
 }
 
-/// Ancestor count from the root (`RootWebArea` depth 0).
-fn node_depth(node_id: &str, parent_of: &HashMap<&str, &str>) -> usize {
-    let mut depth = 0usize;
-    let mut cur = node_id;
-    while let Some(parent) = parent_of.get(cur) {
-        depth += 1;
-        cur = parent;
+/// Memoize depths across parent walks. A path longer than the number of
+/// parent links revisits a node, so the input cannot be a forest.
+fn forest_depths<'a>(
+    nodes: &'a [AXNode],
+    parent_of: &HashMap<&'a str, &'a str>,
+) -> Option<HashMap<&'a str, usize>> {
+    let mut depths: HashMap<&str, usize> = HashMap::with_capacity(nodes.len());
+    let mut path = Vec::new();
+    for node in nodes {
+        let mut current = node.node_id.as_str();
+        let mut depth = loop {
+            if let Some(depth) = depths.get(current) {
+                break *depth;
+            }
+            let Some(&parent) = parent_of.get(current) else {
+                depths.insert(current, 0);
+                break 0;
+            };
+            if path.len() >= parent_of.len() {
+                return None;
+            }
+            path.push(current);
+            current = parent;
+        };
+        while let Some(id) = path.pop() {
+            depth = depth.checked_add(1)?;
+            depths.insert(id, depth);
+        }
     }
-    depth
+    Some(depths)
+}
+
+/// Preserve the original text when invalid links make AX ownership ambiguous.
+fn render_unlinked_nodes(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
+    tracing::warn!("invalid accessibility tree links; preserving nodes in input order");
+    let semantic = nodes
+        .iter()
+        .filter(|node| !node.ignored)
+        .map(|node| {
+            let role = ax_role(node);
+            SemanticNode {
+                action_id: None,
+                name: ax_name(node),
+                extras: ax_extras(node, &role),
+                level: ax_level(node),
+                node_id: node.node_id.clone(),
+                role,
+                depth: 0,
+            }
+        })
+        .collect();
+    (semantic, HashMap::new())
 }
 
 pub fn compress(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
@@ -643,7 +686,7 @@ pub fn compress_with_options(
 fn compress_full(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
     let mut out: Vec<SemanticNode> = Vec::with_capacity(nodes.len());
     let mut map: ActionMap = HashMap::new();
-    let mut next_id: u32 = 1;
+    let mut next_id = Some(1u32);
 
     let mut parent_of: HashMap<&str, &str> = HashMap::new();
     let mut role_of: HashMap<&str, String> = HashMap::with_capacity(nodes.len());
@@ -651,7 +694,9 @@ fn compress_full(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
     let mut index: HashMap<&str, &AXNode> = HashMap::with_capacity(nodes.len());
     for n in nodes {
         role_of.insert(n.node_id.as_str(), ax_role(n));
-        index.insert(n.node_id.as_str(), n);
+        if index.insert(n.node_id.as_str(), n).is_some() {
+            return render_unlinked_nodes(nodes);
+        }
         for child in &n.child_ids {
             parent_of.insert(child.as_str(), n.node_id.as_str());
             children_of
@@ -661,6 +706,9 @@ fn compress_full(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
         }
     }
 
+    let Some(depths) = forest_depths(nodes, &parent_of) else {
+        return render_unlinked_nodes(nodes);
+    };
     let ordered = document_order(nodes, &children_of, &parent_of);
 
     let mut id_of_node: HashMap<&str, u32> = HashMap::new();
@@ -675,12 +723,12 @@ fn compress_full(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
         if !ACTIONABLE_ROLES.contains(&role) {
             continue;
         }
-        if node.backend_node_id.is_none() {
+        let Some(backend_node_id) = node.backend_node_id else {
             continue;
-        }
-        let id = next_id;
-        next_id += 1;
-        map.insert(id, node.backend_node_id.expect("checked above"));
+        };
+        let Some(id) = next_id else { break };
+        next_id = id.checked_add(1);
+        map.insert(id, backend_node_id);
         id_of_node.insert(node.node_id.as_str(), id);
     }
 
@@ -696,7 +744,10 @@ fn compress_full(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
         if name.is_empty() && derives_name_from_children(role) {
             name = derive_name(node.node_id.as_str(), &children_of, &index);
         }
-        let depth = node_depth(node.node_id.as_str(), &parent_of);
+        let depth = depths
+            .get(node.node_id.as_str())
+            .copied()
+            .unwrap_or_default();
         let extras = ax_extras(node, role);
         if ACTIONABLE_ROLES.contains(&role) {
             if let Some(&id) = id_of_node.get(node.node_id.as_str()) {
@@ -732,7 +783,7 @@ fn compress_full(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
 fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
     let mut out: Vec<SemanticNode> = Vec::with_capacity(nodes.len() / 2);
     let mut map: ActionMap = HashMap::new();
-    let mut next_id: u32 = 1;
+    let mut next_id = Some(1u32);
 
     // Indexes (single pass, no per-node re-computation in the hot loop).
     let mut parent_of: HashMap<&str, &str> = HashMap::new();
@@ -741,7 +792,9 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
     let mut index: HashMap<&str, &AXNode> = HashMap::with_capacity(nodes.len());
     for n in nodes {
         role_of.insert(n.node_id.as_str(), ax_role(n));
-        index.insert(n.node_id.as_str(), n);
+        if index.insert(n.node_id.as_str(), n).is_some() {
+            return render_unlinked_nodes(nodes);
+        }
         for child in &n.child_ids {
             parent_of.insert(child.as_str(), n.node_id.as_str());
             children_of
@@ -767,6 +820,9 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
 
     // Chromium returns the AX tree breadth-first; restore document order so
     // the agent reads the page the way it is laid out.
+    let Some(depths) = forest_depths(nodes, &parent_of) else {
+        return render_unlinked_nodes(nodes);
+    };
     let ordered = document_order(nodes, &children_of, &parent_of);
 
     // Bottom-up pass: identify visible non-ARIA elements with explicit click
@@ -844,12 +900,12 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
             {
                 continue;
             }
-            if node.backend_node_id.is_none() {
+            let Some(backend_node_id) = node.backend_node_id else {
                 continue;
-            }
-            let id = next_id;
-            next_id += 1;
-            map.insert(id, node.backend_node_id.expect("checked above"));
+            };
+            let Some(id) = next_id else { break };
+            next_id = id.checked_add(1);
+            map.insert(id, backend_node_id);
             id_of_node.insert(node.node_id.as_str(), id);
         }
     }
@@ -947,7 +1003,10 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
                     extras: ax_extras(node, role),
                     level: None,
                     node_id: node.node_id.clone(),
-                    depth: node_depth(node.node_id.as_str(), &parent_of),
+                    depth: depths
+                        .get(node.node_id.as_str())
+                        .copied()
+                        .unwrap_or_default(),
                 });
                 continue;
             }
@@ -982,7 +1041,10 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
                     name: text.clone(),
                     extras: Vec::new(),
                     node_id: node.node_id.clone(),
-                    depth: node_depth(node.node_id.as_str(), &parent_of),
+                    depth: depths
+                        .get(node.node_id.as_str())
+                        .copied()
+                        .unwrap_or_default(),
                 });
             }
             // The cells themselves are emitted as part of the row line.
@@ -1014,7 +1076,10 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
                 name: String::new(),
                 extras: Vec::new(),
                 node_id: node.node_id.clone(),
-                depth: node_depth(node.node_id.as_str(), &parent_of),
+                depth: depths
+                    .get(node.node_id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
             });
             continue;
         }
@@ -1091,7 +1156,10 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
                     extras,
                     level: None,
                     node_id: node.node_id.clone(),
-                    depth: node_depth(node.node_id.as_str(), &parent_of),
+                    depth: depths
+                        .get(node.node_id.as_str())
+                        .copied()
+                        .unwrap_or_default(),
                 });
                 continue;
             }
@@ -1116,7 +1184,10 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
             name,
             extras,
             node_id: node.node_id.clone(),
-            depth: node_depth(node.node_id.as_str(), &parent_of),
+            depth: depths
+                .get(node.node_id.as_str())
+                .copied()
+                .unwrap_or_default(),
         });
     }
 
@@ -1157,6 +1228,27 @@ mod tests {
     fn with_children(mut n: AXNode, children: &[&str]) -> AXNode {
         n.child_ids = children.iter().map(|s| s.to_string()).collect();
         n
+    }
+
+    #[test]
+    fn cyclic_or_duplicate_links_preserve_non_ignored_text() {
+        let input = serde_json::json!([
+            {"nodeId":"1","ignored":false,"role":{"value":"button"},"name":{"value":"First"},"childIds":["2"],"backendDOMNodeId":3},
+            {"nodeId":"2","ignored":false,"role":{"value":"button"},"name":{"value":"Second"},"childIds":["1"],"backendDOMNodeId":4}
+        ]);
+        let mut input: Vec<AXNode> = serde_json::from_value(input).unwrap();
+        let (out, actions) = compress(&input);
+        assert_eq!(
+            out.iter()
+                .map(|node| node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+        assert!(actions.is_empty());
+        input[1].node_id = input[0].node_id.clone();
+        let (out, actions) = compress(&input);
+        assert_eq!(out.len(), 2);
+        assert!(actions.is_empty());
     }
 
     #[test]

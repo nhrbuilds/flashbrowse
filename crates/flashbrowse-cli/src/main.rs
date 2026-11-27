@@ -12,11 +12,134 @@
 //! flashbrowse close --session-id s1
 //! ```
 
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::print_stderr,
+        clippy::print_stdout,
+        clippy::string_slice,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
+#[cfg(all(not(test), panic = "abort"))]
+compile_error!("flashbrowse requires panic unwinding for MCP recovery.");
+
 mod commands;
 mod resource_policy;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+fn main() -> std::process::ExitCode {
+    std::panic::set_hook(Box::new(|info| {
+        if let Some(location) = info.location() {
+            write_stderr_raw(format_args!(
+                "flashbrowse: unexpected internal panic at {}:{}\n",
+                location.file(),
+                location.line()
+            ));
+        } else {
+            write_stderr_raw(format_args!("flashbrowse: unexpected internal panic\n"));
+        }
+    }));
+
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    }));
+    let runtime = match built {
+        Ok(Ok(runtime)) => runtime,
+        Ok(Err(err)) => {
+            write_stderr(format_args!(
+                "flashbrowse: could not start the async runtime: {err}"
+            ));
+            return std::process::ExitCode::FAILURE;
+        }
+        Err(payload) => {
+            flashbrowse_core::async_runtime::discard_panic_payload(payload);
+            write_stderr(format_args!(
+                "flashbrowse: could not start the async runtime because of an internal failure"
+            ));
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(run_cli())));
+    let result = match result {
+        Ok(result) => Some(result),
+        Err(payload) => {
+            flashbrowse_core::async_runtime::discard_panic_payload(payload);
+            None
+        }
+    };
+    let shutdown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    }));
+    if let Err(payload) = shutdown {
+        flashbrowse_core::async_runtime::discard_panic_payload(payload);
+        write_stderr(format_args!(
+            "flashbrowse: async runtime shutdown had an internal failure"
+        ));
+        return std::process::ExitCode::FAILURE;
+    }
+
+    let Some(result) = result else {
+        return std::process::ExitCode::FAILURE;
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err)
+            if err
+                .downcast_ref::<OutputError>()
+                .is_some_and(|err| err.0.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            std::process::ExitCode::SUCCESS
+        }
+        Err(err) => {
+            write_stderr(format_args!("flashbrowse: {err:#}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OutputError(std::io::Error);
+
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "could not write stdout: {}", self.0)
+    }
+}
+
+impl std::error::Error for OutputError {}
+
+fn write_stdout(message: std::fmt::Arguments<'_>) -> Result<(), OutputError> {
+    use std::io::Write;
+    let mut output = std::io::stdout().lock();
+    writeln!(output, "{message}")
+        .and_then(|()| output.flush())
+        .map_err(OutputError)
+}
+
+fn write_stderr_raw(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = std::io::stderr().lock().write_fmt(message);
+}
+
+fn write_stderr(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{message}");
+}
 
 /// Parse `FLASHBROWSE_TEXT_ONLY` truthy values (`1|true|yes|on`).
 fn env_text_only() -> bool {
@@ -171,8 +294,7 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let text_only = cli.text_only || env_text_only();
     let resource_policy = resource_policy::resolve_resource_policy(
@@ -201,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
     match log_format {
         flashbrowse_core::observability::LogFormat::Json => {
             tracing_subscriber::fmt()
+                .log_internal_errors(false)
                 .with_writer(std::io::stderr)
                 .with_max_level(level)
                 .json()
@@ -210,6 +333,7 @@ async fn main() -> anyhow::Result<()> {
         }
         flashbrowse_core::observability::LogFormat::Text => {
             tracing_subscriber::fmt()
+                .log_internal_errors(false)
                 .with_writer(std::io::stderr)
                 .with_max_level(level)
                 .try_init()
@@ -217,8 +341,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Graceful shutdown: SIGINT/SIGTERM must not orphan a browser. (On Linux
-    // the child also gets PR_SET_PDEATHSIG, so even SIGKILL is covered.)
+    // Handle SIGINT and SIGTERM so owned browser process guards can run.
     //
     // `tokio::signal::unix` only exists on unix; Windows has no SIGTERM, so
     // console Ctrl+C (`ctrl_c`) is the only shutdown signal it can receive.
@@ -308,16 +431,13 @@ async fn main() -> anyhow::Result<()> {
             }
             Commands::Setup { force } => commands::setup::run(force).await,
             Commands::Doctor { json } => {
-                let ok = commands::doctor::run(json).await;
+                let ok = commands::doctor::run(json).await?;
                 if !ok {
                     std::process::exit(1);
                 }
                 Ok(())
             }
-            Commands::Stats { limit, json } => {
-                commands::stats::run(limit, json);
-                Ok(())
-            }
+            Commands::Stats { limit, json } => commands::stats::run(limit, json),
             Commands::Update { check } => commands::update::run(check).await,
             Commands::Close { session_id } => commands::close::run(session_id).await,
         }
@@ -349,6 +469,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let ms = started.elapsed().as_millis() as u64;
+    if outcome
+        .as_ref()
+        .err()
+        .and_then(|err| err.downcast_ref::<OutputError>())
+        .is_some_and(|err| err.0.kind() == std::io::ErrorKind::BrokenPipe)
+    {
+        return outcome;
+    }
     match &outcome {
         Ok(()) => flashbrowse_core::observability::log_event(
             log_format,

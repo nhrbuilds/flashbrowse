@@ -1,6 +1,6 @@
-//! ## Significantly larger stress test (Phase 2/3/4 proof point)
+//! ## Additional integration stress coverage
 //!
-//! Proves beyond the 19-test baseline:
+//! Exercises:
 //! 1. Compression at 50k-node scale (CPU + reduction).
 //! 2. 20 sequential navigations on one live session (latency, leaks).
 //! 3. 100-action storm (click/fill/scroll/press_key p50/p95).
@@ -195,6 +195,58 @@ async fn stress_parallel_sessions_x5() {
     assert!(elapsed.as_secs() < 30, "parallel 5 too slow: {elapsed:?}");
 }
 
+/// Real pages used by the token test, with content that only the real page
+/// has. A marker is required because an error page must never be measured as
+/// a compression result.
+const REAL_PAGES: &[(&str, &str)] = &[
+    ("https://example.com", "Example Domain"),
+    ("https://news.ycombinator.com", "comments"),
+];
+
+/// Hacker News answers bursty clients with this page and HTTP 200. It is not
+/// the site, and its tiny tree must not be reported as a token reduction.
+const RATE_LIMIT_MARKER: &str = "Sorry, we're not able to serve your requests this quickly.";
+
+/// Open a real page, retrying once on a transient network failure.
+///
+/// Local browser launch failures still fail the test loudly (`expect`); only
+/// live network errors or interstitial pages are retried and skipped.
+async fn open_real_page(url: &str, marker: &str) -> Option<(BrowserSession, String, u128)> {
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let mut session = match BrowserSession::launch(SessionConfig::default()).await {
+            Ok(session) => session,
+            Err(err) if attempt == 0 => {
+                eprintln!("STRESS-REAL {url}: launch failed ({err}); retrying");
+                continue;
+            }
+            Err(err) => panic!("launch failed twice for {url}: {err}"),
+        };
+        let t0 = Instant::now();
+        match session.open(url).await {
+            Ok(tree) if !tree.contains(RATE_LIMIT_MARKER) && tree.contains(marker) => {
+                return Some((session, tree, t0.elapsed().as_millis()));
+            }
+            Ok(tree) => {
+                eprintln!(
+                    "STRESS-REAL {url}: unusable page ({} chars, marker={}, rate_limited={})",
+                    tree.len(),
+                    tree.contains(marker),
+                    tree.contains(RATE_LIMIT_MARKER)
+                );
+                session.shutdown().await;
+            }
+            Err(e) => {
+                eprintln!("STRESS-REAL {url}: open failed: {e}");
+                session.shutdown().await;
+            }
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn stress_real_world_tokens() {
     if skip_if_no_chrome() {
@@ -209,13 +261,12 @@ async fn stress_real_world_tokens() {
         println!("SKIP: no network");
         return;
     }
-    for url in ["https://example.com", "https://news.ycombinator.com"] {
-        let mut s = BrowserSession::launch(SessionConfig::default())
-            .await
-            .expect("launch");
-        let t0 = Instant::now();
-        let tree = s.open(url).await.expect("real open");
-        let ms = t0.elapsed().as_millis();
+    let mut measured = 0usize;
+    for &(url, marker) in REAL_PAGES {
+        let Some((s, tree, ms)) = open_real_page(url, marker).await else {
+            println!("SKIP: {url} unreachable or served an interstitial");
+            continue;
+        };
         let raw = s
             .client()
             .send(
@@ -246,8 +297,12 @@ async fn stress_real_world_tokens() {
                 0.0
             }
         );
-        assert!(tree.len() > 100, "real tree too small for {url}");
+        assert!(raw > 0, "empty raw HTML for {url}");
+        measured += 1;
         s.shutdown().await;
+    }
+    if measured == 0 {
+        println!("SKIP: 0 of {} real pages measured", REAL_PAGES.len());
     }
 }
 

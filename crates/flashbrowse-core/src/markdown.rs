@@ -16,21 +16,24 @@ pub const EXTRACT_SCRIPT: &str = r#"
   lines.push('# ' + (title || 'Untitled'));
   lines.push('');
   const roots = [];
-  const collectRoots = (root) => {
-    if (!root) return;
+  const pending = [document];
+  const visited = new Set();
+  while (pending.length) {
+    const root = pending.pop();
+    if (!root || visited.has(root)) continue;
+    visited.add(root);
     roots.push(root);
+    const children = [];
     for (const el of root.querySelectorAll('*')) {
-      if (el.shadowRoot) {
-        collectRoots(el.shadowRoot);
-      }
+      if (el.shadowRoot) children.push(el.shadowRoot);
       if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
         try {
-          if (el.contentDocument) collectRoots(el.contentDocument);
+          if (el.contentDocument) children.push(el.contentDocument);
         } catch (_) {}
       }
     }
-  };
-  collectRoots(document);
+    for (let i = children.length - 1; i >= 0; i--) pending.push(children[i]);
+  }
   const seen = new Set();
   for (const root of roots) {
   for (const el of root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,pre,blockquote')) {

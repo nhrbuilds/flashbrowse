@@ -12,6 +12,9 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }
+
+tempfile = "3.27"
 
 [dev-dependencies]
 flashbrowse-cdp = { path = "../flashbrowse-cdp" }

@@ -34,7 +34,8 @@ fn spawn_server() -> u16 {
 /// HTTP server that serves `html` on `/` and the blue PNG on `/p.png`.
 fn spawn_server_with(html: &str) -> u16 {
     use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::net::{Shutdown, TcpListener};
+    use std::time::Duration;
 
     let html = html.to_string();
     let png = BLUE_PNG.to_vec();
@@ -43,36 +44,43 @@ fn spawn_server_with(html: &str) -> u16 {
     let port = listener.local_addr().expect("addr").port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let mut path = String::from("/");
-            {
-                let mut reader = BufReader::new(match stream.try_clone() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                });
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if line == "\r\n" || line == "\n" {
-                        break;
+            let Ok(stream) = stream else { continue };
+            let html = html.clone();
+            let png = png.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut path = String::from("/");
+                if let Ok(cloned) = stream.try_clone() {
+                    let mut reader = BufReader::new(cloned);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
                     }
                     if let Some(rest) = line.strip_prefix("GET ") {
                         path = rest.split_whitespace().next().unwrap_or("/").to_string();
                     }
-                    line.clear();
+                    while line != "\r\n" && line != "\n" {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            break;
+                        }
+                    }
                 }
-            }
-            let (body, ctype): (Vec<u8>, &str) = if path.starts_with("/p.png") {
-                (png.clone(), "image/png")
-            } else {
-                (html.clone().into_bytes(), "text/html")
-            };
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(&body);
-            let _ = stream.flush();
+                let (body, ctype): (Vec<u8>, &str) = if path.starts_with("/p.png") {
+                    (png, "image/png")
+                } else {
+                    (html.into_bytes(), "text/html")
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            });
         }
     });
     port
@@ -116,6 +124,7 @@ async fn screenshot_does_not_burn_the_timeout_on_a_blocked_image() {
             full_page: false,
             prepare_lazy_content: true,
             timeout_ms: 8_000,
+            ..Default::default()
         })
         .await
         .expect("screenshot");
@@ -158,6 +167,7 @@ async fn blocked_image_is_rendered_after_the_lift() {
                 full_page: false,
                 prepare_lazy_content: false,
                 timeout_ms: 3_000,
+                ..Default::default()
             })
             .await
             .expect("screenshot");
@@ -216,11 +226,13 @@ async fn screenshot_preserves_the_scroll_position() {
         .expect("launch");
     session.open(&url).await.expect("open");
 
-    // Scroll down so there is a position to preserve.
+    // Set a known scroll position directly. This test covers screenshot
+    // position preservation; synthetic wheel input is covered by the action
+    // tests and can vary with platform/browser viewport behavior.
     session
-        .scroll(flashbrowse_core::actions::ScrollDirection::Down, 2000.0)
+        .evaluate("window.scrollTo(0, 2000); true")
         .await
-        .expect("scroll");
+        .expect("set initial scroll position");
 
     let pos_before = session.evaluate_scroll_y().await;
     assert!(pos_before > 0.0, "scroll did not move the page");
@@ -230,6 +242,7 @@ async fn screenshot_preserves_the_scroll_position() {
             full_page: false,
             prepare_lazy_content: true,
             timeout_ms: 3_000,
+            ..Default::default()
         })
         .await
         .expect("screenshot");
@@ -239,6 +252,60 @@ async fn screenshot_preserves_the_scroll_position() {
         (pos_after - pos_before).abs() < 5.0,
         "the screenshot moved the viewport: {pos_before} -> {pos_after}"
     );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelled_screenshot_invalidates_session_and_restores_scroll() {
+    if no_chrome() {
+        return;
+    }
+    let config = SessionConfig {
+        persistent: true,
+        ..Default::default()
+    };
+    let mut session = BrowserSession::launch(config.clone()).await.unwrap();
+    session
+        .open("data:text/html,<h1>Cancel</h1><div style='height:8000px'></div>")
+        .await
+        .unwrap();
+    session
+        .evaluate("window.scrollTo(0, 120); true")
+        .await
+        .unwrap();
+    let before = session.evaluate_scroll_y().await;
+    let ws = session.browser_ws_url().to_string();
+    let target = session.target_id().to_string();
+    {
+        let screenshot = session.screenshot(ScreenshotOptions::default());
+        let wait_for_scroll = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if session.evaluate_scroll_y().await > before + 100.0 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("screenshot did not scroll the page");
+        };
+        tokio::select! {
+            _ = wait_for_scroll => {},
+            result = screenshot => panic!("screenshot finished before cancellation: {result:?}"),
+        }
+    }
+    assert!(!session.client().is_connected());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let attached = BrowserSession::attach(ws, Some(target), &config)
+        .await
+        .unwrap();
+    let after = attached.evaluate_scroll_y().await;
+    assert!(
+        (before - after).abs() < 5.0,
+        "scroll changed from {before} to {after}"
+    );
+    attached.shutdown().await;
     session.shutdown().await;
 }
 
@@ -259,6 +326,7 @@ async fn screenshot_timeout_is_capped() {
             full_page: false,
             prepare_lazy_content: true,
             timeout_ms: u64::MAX,
+            ..Default::default()
         })
         .await;
     assert!(

@@ -1,5 +1,5 @@
 //! End-to-end MCP JSON-RPC validation over duplex pipes.
-//! Drives `serve()` in-process (no binary needed until Phase 4 CLI wiring).
+//! Drives `serve()` over in-memory I/O without spawning the CLI binary.
 //! Requires system Chromium - skipped when absent.
 
 use flashbrowse_core::SessionConfig;
@@ -26,6 +26,60 @@ where
     let v: Value = serde_json::from_str(line.trim()).expect("stdout line must be JSON");
     assert_eq!(v.get("jsonrpc").and_then(|x| x.as_str()), Some("2.0"));
     v
+}
+
+/// Spawn a Windows-safe test HTTP server that drains full request headers,
+/// handles concurrent preconnect sockets per thread, and performs a graceful write shutdown.
+fn spawn_raw_http<F>(handler: F) -> u16
+where
+    F: Fn(&str, &str) -> (&'static str, &'static str, String) + Send + Sync + 'static,
+{
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let handler = Arc::new(handler);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let handler = Arc::clone(&handler);
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut head = String::new();
+                if let Ok(cloned) = stream.try_clone() {
+                    let mut reader = StdBufReader::new(cloned);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        head.push_str(&line);
+                        line.clear();
+                    }
+                }
+                if head.is_empty() {
+                    return;
+                }
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (status, content_type, body) = handler(path, &head);
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            });
+        }
+    });
+    port
 }
 
 #[tokio::test]
@@ -81,7 +135,7 @@ async fn test_mcp_stdio_e2e() {
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .expect("tools list");
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 18);
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
@@ -329,6 +383,8 @@ async fn test_mcp_delayed_http_popup_and_opener_fallback() {
                     body
                 );
                 let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
             });
         }
     });
@@ -557,6 +613,8 @@ async fn test_mcp_storage_state_import_export() {
                     format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
                 };
                 let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.flush().await;
+                let _ = sock.shutdown().await;
             });
         }
     });
@@ -782,6 +840,247 @@ async fn test_mcp_live_policy_switch_preserves_browser_session() {
     server.await.expect("MCP server");
 }
 
+#[tokio::test]
+async fn test_mcp_navigate_and_wait_for() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let port = spawn_raw_http(|path, _| {
+        let body = if path.split('?').next().unwrap_or("/") == "/two" {
+            r#"<!doctype html><html><head><title>Page Two</title></head><body><h1>Page Two</h1><div id="host"></div><script>
+setTimeout(() => {
+  const host = document.getElementById('host');
+  const root = host.attachShadow({mode: 'open'});
+  root.innerHTML = '<p class="delayed-ready">Shadow Ready Now</p>';
+  history.pushState({}, '', '/two?ready=1');
+}, 200);
+</script></body></html>"#
+        } else {
+            r#"<!doctype html><html><head><title>Page One</title></head><body><h1>Page One</h1><a href="/two">Go Two</a></body></html>"#
+        };
+        ("200 OK", "text/html; charset=utf-8", body.to_string())
+    });
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve")
+    });
+
+    let init = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+    ).await;
+    assert!(init.get("error").is_none());
+
+    let p1 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":format!("http://127.0.0.1:{port}/")}}}),
+    ).await;
+    assert_tool_ok(&p1);
+    assert!(tool_text(&p1).contains("Page One"));
+
+    let p2 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":format!("http://127.0.0.1:{port}/two")}}}),
+    ).await;
+    assert_tool_ok(&p2);
+    assert!(tool_text(&p2).contains("Page Two"));
+
+    let w_text = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_wait_for","arguments":{"text":"Shadow Ready Now","timeout_ms":4000}}}),
+    ).await;
+    assert_tool_ok(&w_text);
+    assert!(tool_text(&w_text).contains("Shadow Ready Now"));
+
+    let w_sel = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_wait_for","arguments":{"selector":".delayed-ready","timeout_ms":2000}}}),
+    ).await;
+    assert_tool_ok(&w_sel);
+
+    let w_url = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_wait_for","arguments":{"url":"ready=1","timeout_ms":2000}}}),
+    ).await;
+    assert_tool_ok(&w_url);
+
+    // Go back from /two?ready=1 -> /two -> /
+    let back1 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"action":"back"}}}),
+    ).await;
+    assert_tool_ok(&back1);
+    let back2 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"action":"back"}}}),
+    ).await;
+    assert_tool_ok(&back2);
+    assert!(
+        tool_text(&back2).contains("Page One"),
+        "back did not return to Page One: {back2}"
+    );
+
+    let fwd = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"action":"forward"}}}),
+    ).await;
+    assert_tool_ok(&fwd);
+    assert!(
+        tool_text(&fwd).contains("Page Two"),
+        "forward did not return to Page Two: {fwd}"
+    );
+
+    let rel = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"action":"reload","ignore_cache":true}}}),
+    ).await;
+    assert_tool_ok(&rel);
+    assert!(
+        tool_text(&rel).contains("Page Two"),
+        "reload did not return Page Two: {rel}"
+    );
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+}
+
+#[tokio::test]
+async fn test_mcp_rich_inputs_dblclick_rightclick_drag_chords_and_container_scroll() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve")
+    });
+
+    let init = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+    ).await;
+    assert!(init.get("error").is_none());
+
+    let html = r#"<!doctype html><html><body style="margin:0;padding:16px">
+<button id="dbl" ondblclick="this.textContent='DBL_OK'">DoubleBtn</button>
+<button id="rc" oncontextmenu="event.preventDefault();this.textContent='CTX_OK'">RightBtn</button>
+<button id="src" style="display:inline-block;width:80px;height:40px">DragSrc</button>
+<button id="dst" style="display:inline-block;width:80px;height:40px;margin-left:120px">DragDst</button>
+<div id="scroller" style="height:80px;overflow-y:auto;border:1px solid black;margin-top:12px">
+  <button id="inside">InnerBtn</button>
+  <div style="height:600px">Tall inner content</div>
+</div>
+<p id="status">init</p>
+<script>
+let dragging = false;
+document.getElementById('src').addEventListener('mousedown', () => { dragging = true; });
+document.getElementById('dst').addEventListener('mouseup', () => {
+  if (dragging) { document.getElementById('status').textContent = 'DRAG_OK'; dragging = false; }
+});
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    document.getElementById('status').textContent = 'CHORD_OK';
+  }
+});
+</script></body></html>"#;
+    let url = format!("data:text/html,{}", html.replace('\n', ""));
+    let open = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":url}}}),
+    ).await;
+    assert_tool_ok(&open);
+
+    let dbl = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":1,"action":"double_click"}}}),
+    ).await;
+    assert_tool_ok(&dbl);
+    assert!(
+        tool_text(&dbl).contains("DBL_OK"),
+        "double_click failed: {dbl}"
+    );
+
+    let rc = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":2,"action":"right_click"}}}),
+    ).await;
+    assert_tool_ok(&rc);
+    assert!(
+        tool_text(&rc).contains("CTX_OK"),
+        "right_click failed: {rc}"
+    );
+
+    let drag = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":3,"target_action_id":4,"action":"drag_and_drop"}}}),
+    ).await;
+    assert_tool_ok(&drag);
+    assert!(
+        tool_text(&drag).contains("DRAG_OK"),
+        "drag_and_drop failed: {drag}"
+    );
+
+    let chord = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_act","arguments":{"action":"press_key","value":"Control+k"}}}),
+    ).await;
+    assert_tool_ok(&chord);
+    assert!(
+        tool_text(&chord).contains("CHORD_OK"),
+        "Control+k chord failed: {chord}"
+    );
+
+    let scroll = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":5,"action":"scroll","value":"down","amount":200}}}),
+    ).await;
+    assert_tool_ok(&scroll);
+    let st = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.getElementById('scroller').scrollTop > 0"}}}),
+    ).await;
+    assert!(
+        tool_text(&st).contains("true"),
+        "inner container did not scroll: {st}"
+    );
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+}
+
 fn tool_text(resp: &Value) -> String {
     resp.get("result")
         .and_then(|r| r.get("content"))
@@ -805,4 +1104,383 @@ fn assert_tool_ok(resp: &Value) {
         "tool returned isError: {}",
         tool_text(resp)
     );
+}
+
+#[tokio::test]
+async fn test_mcp_console_network_headers_and_fetch_route_mocking() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let port = spawn_raw_http(|path, req| {
+        if path == "/api/echo" {
+            let has_auth = req
+                .to_ascii_lowercase()
+                .contains("x-test-token: secret-123");
+            (
+                "200 OK",
+                "application/json",
+                format!("{{\"source\":\"real\",\"auth\":{has_auth}}}"),
+            )
+        } else if path == "/api/fail" {
+            (
+                "404 Not Found",
+                "application/json",
+                "{\"error\":\"not_found\"}".to_string(),
+            )
+        } else {
+            (
+                "200 OK",
+                "text/html; charset=utf-8",
+                r#"<!doctype html><html><body><h1>Obs Test</h1><pre id="out"></pre><script>
+console.error('boom-error');
+fetch('/api/fail').catch(() => {});
+setTimeout(() => { throw new Error('uncaught-boom'); }, 10);
+</script></body></html>"#
+                    .to_string(),
+            )
+        }
+    });
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve")
+    });
+
+    let init = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+    ).await;
+    assert!(init.get("error").is_none());
+
+    let open = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":format!("http://127.0.0.1:{port}/")}}}),
+    ).await;
+    assert_tool_ok(&open);
+
+    let cons = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_console","arguments":{"action":"list"}}}),
+    ).await;
+    assert_tool_ok(&cons);
+    let cons_txt = tool_text(&cons);
+    assert!(
+        cons_txt.contains("boom-error") && cons_txt.contains("uncaught-boom"),
+        "console missing expected entries: {cons_txt}"
+    );
+
+    let net_fail = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"list","failed_only":true}}}),
+    ).await;
+    assert_tool_ok(&net_fail);
+    let net_entries: Value = serde_json::from_str(&tool_text(&net_fail)).expect("network JSON");
+    let fail_req_id = net_entries
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|e| e["url"].as_str().is_some_and(|u| u.contains("/api/fail")))
+        })
+        .and_then(|e| e["request_id"].as_str())
+        .expect("/api/fail entry")
+        .to_string();
+
+    let body = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"body","request_id":fail_req_id}}}),
+    ).await;
+    assert_tool_ok(&body);
+    assert!(
+        tool_text(&body).contains("not_found"),
+        "body mismatch: {body}"
+    );
+
+    let set_hdr = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"set_headers","headers":{"X-Test-Token":"secret-123"}}}}),
+    ).await;
+    assert_tool_ok(&set_hdr);
+
+    let sync_get = "(() => { const x = new XMLHttpRequest(); x.open('GET', '/api/echo', false); x.send(); return x.responseText; })()";
+    let real_fetch = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":sync_get}}}),
+    ).await;
+    assert_tool_ok(&real_fetch);
+    let real_str: String = serde_json::from_str(&tool_text(&real_fetch)).expect("json string");
+    assert!(
+        real_str.contains("\"auth\":true"),
+        "extra header did not reach server: {real_str}"
+    );
+
+    let add_route = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"browser_route","arguments":{"action":"add","url_pattern":"*/api/echo","status":200,"content_type":"application/json","body":"{\"source\":\"mocked\"}"}}}),
+    ).await;
+    assert_tool_ok(&add_route);
+
+    let mock_fetch = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":sync_get}}}),
+    ).await;
+    assert_tool_ok(&mock_fetch);
+    assert!(
+        tool_text(&mock_fetch).contains("mocked"),
+        "route mock did not intercept /api/echo: {mock_fetch}"
+    );
+
+    let clr_route = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_route","arguments":{"action":"clear"}}}),
+    ).await;
+    assert_tool_ok(&clr_route);
+
+    let after_clear = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":sync_get}}}),
+    ).await;
+    assert_tool_ok(&after_clear);
+    let after_str: String = serde_json::from_str(&tool_text(&after_clear)).expect("json string");
+    assert!(
+        after_str.contains("\"source\":\"real\""),
+        "real server did not respond after route clear: {after_str}"
+    );
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+}
+
+#[tokio::test]
+async fn test_mcp_isolated_multi_context_cookies_and_storage() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let port = spawn_raw_http(|_, _| {
+        (
+            "200 OK",
+            "text/html; charset=utf-8",
+            "<!doctype html><html><body><h1>Context Page</h1></body></html>".to_string(),
+        )
+    });
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve")
+    });
+
+    let init = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+    ).await;
+    assert!(init.get("error").is_none());
+
+    let url = format!("http://127.0.0.1:{port}/");
+
+    // Open in default context and set cookie + localStorage
+    let open_def = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":url}}}),
+    ).await;
+    assert_tool_ok(&open_def);
+    let set_def = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.cookie='who=alice'; localStorage.setItem('k','alice'); 'ok'"}}}),
+    ).await;
+    assert_tool_ok(&set_def);
+
+    // Create isolated context 'bob'
+    let create_bob = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_contexts","arguments":{"action":"create","name":"bob"}}}),
+    ).await;
+    assert_tool_ok(&create_bob);
+
+    let open_bob = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":url}}}),
+    ).await;
+    assert_tool_ok(&open_bob);
+
+    let read_bob = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.cookie + '|' + (localStorage.getItem('k') || 'none')"}}}),
+    ).await;
+    assert_tool_ok(&read_bob);
+    assert!(
+        tool_text(&read_bob).contains("|none"),
+        "isolated context leaked default cookie/storage: {read_bob}"
+    );
+
+    let set_bob = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.cookie='who=bob'; localStorage.setItem('k','bob'); 'ok'"}}}),
+    ).await;
+    assert_tool_ok(&set_bob);
+
+    // Switch back to default and confirm Alice's state is untouched
+    let sel_def = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"browser_contexts","arguments":{"action":"select","name":"default"}}}),
+    ).await;
+    assert_tool_ok(&sel_def);
+    let read_def = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.cookie + '|' + localStorage.getItem('k')"}}}),
+    ).await;
+    assert!(
+        tool_text(&read_def).contains("who=alice|alice"),
+        "default context was polluted by bob: {read_def}"
+    );
+
+    // Close bob and confirm closing default is rejected
+    let close_bob = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_contexts","arguments":{"action":"close","name":"bob"}}}),
+    ).await;
+    assert_tool_ok(&close_bob);
+
+    let close_def = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"browser_contexts","arguments":{"action":"close","name":"default"}}}),
+    ).await;
+    assert_eq!(close_def["result"]["isError"], true);
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+}
+
+#[tokio::test]
+async fn test_mcp_emulate_viewport_tz_geo_permissions_element_clip_and_pdf() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!("flashbrowse-pdf-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cfg = SessionConfig {
+        mcp_file_root: Some(root.clone()),
+        ..Default::default()
+    };
+
+    let (server_in, mut client_out) = duplex(256 * 1024);
+    let (server_out, client_in) = duplex(256 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, cfg).await.expect("serve");
+    });
+
+    let init = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+    ).await;
+    assert!(init.get("error").is_none());
+
+    let open = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":"data:text/html,<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head><body style='margin:0'><button style='width:120px;height:40px'>TargetBtn</button></body></html>"}}}),
+    ).await;
+    assert_tool_ok(&open);
+
+    let emu = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{
+                "name":"browser_emulate",
+                "arguments":{
+                    "viewport":{"width":390,"height":844,"device_scale_factor":2.0,"mobile":true},
+                    "timezone":"Asia/Tokyo",
+                    "locale":"ja-JP",
+                    "geolocation":{"latitude":35.6762,"longitude":139.6503,"accuracy":5.0},
+                    "permissions":{"grants":["geolocation"]}
+                }
+            }
+        }),
+    )
+    .await;
+    assert_tool_ok(&emu);
+
+    let check = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"window.innerWidth + '|' + Intl.DateTimeFormat().resolvedOptions().timeZone"}}}),
+    ).await;
+    assert_tool_ok(&check);
+    assert!(
+        tool_text(&check).contains("390|Asia/Tokyo"),
+        "emulation did not apply: {check}"
+    );
+
+    // Element-clipped screenshot of action_id 1
+    let clip_shot = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_screenshot","arguments":{"action_id":1}}}),
+    ).await;
+    assert_tool_ok(&clip_shot);
+    assert_eq!(clip_shot["result"]["content"][0]["type"], "image");
+    let b64 = clip_shot["result"]["content"][0]["data"]
+        .as_str()
+        .expect("png base64");
+    assert!(!b64.is_empty());
+
+    // PDF export confined under mcp_file_root/pdfs/
+    let pdf = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_pdf","arguments":{"name":"sample-report","landscape":true}}}),
+    ).await;
+    assert_tool_ok(&pdf);
+    let pdf_meta: Value = serde_json::from_str(&tool_text(&pdf)).expect("pdf JSON");
+    let pdf_path = std::path::PathBuf::from(pdf_meta["path"].as_str().expect("pdf path"));
+    let pdf_bytes = std::fs::read(&pdf_path).expect("read exported pdf");
+    assert!(
+        pdf_bytes.starts_with(b"%PDF-"),
+        "exported file is not a PDF"
+    );
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+    let _ = std::fs::remove_dir_all(root);
 }

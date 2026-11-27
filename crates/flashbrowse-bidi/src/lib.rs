@@ -6,6 +6,27 @@
 //!
 //! This crate currently provides binary discovery and launch option types only.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::print_stderr,
+        clippy::print_stdout,
+        clippy::string_slice,
+        clippy::panic,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable,
+        clippy::unwrap_used
+    )
+)]
+
+#[cfg(all(not(test), panic = "abort"))]
+compile_error!("flashbrowse requires panic unwinding for panic recovery.");
+
 mod launcher;
 
 pub use launcher::{find_firefox, firefox_version, FirefoxLaunchOptions, FirefoxNotAvailable};

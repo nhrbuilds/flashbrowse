@@ -1,0 +1,41 @@
+{
+  "generatedAt": "2026-11-26T17:43:31.441Z",
+  "binary": "./target/release/flashbrowse",
+  "pages": [
+    {
+      "url": "https://example.com",
+      "ok": true,
+      "ms": 2086,
+      "staticTexts": 6,
+      "missing": [],
+      "rawBytes": 11752,
+      "treeBytes": 1128,
+      "reduction": 0.9040163376446563
+    },
+    {
+      "url": "https://news.ycombinator.com",
+      "ok": true,
+      "ms": 2206,
+      "staticTexts": 1,
+      "missing": [],
+      "rawBytes": 405699,
+      "treeBytes": 14059,
+      "reduction": 0.9653462295938615
+    },
+    {
+      "url": "https://en.wikipedia.org/wiki/Main_Page",
+      "ok": true,
+      "ms": 3464,
+      "staticTexts": 258,
+      "missing": [],
+      "rawBytes": 1296698,
+      "treeBytes": 87162,
+      "reduction": 0.9327815728874418
+    }
+  ],
+  "summary": {
+    "pages": 3,
+    "failed": 0,
+    "missing": 0
+  }
+}

@@ -170,7 +170,9 @@ pub fn count_actions(tree: &str) -> usize {
     tree.lines()
         .filter(|l| {
             let t = l.trim_start();
-            t.starts_with('[') && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit())
+            t.strip_prefix('[')
+                .and_then(|tail| tail.chars().next())
+                .is_some_and(|c| c.is_ascii_digit())
         })
         .count()
 }
@@ -254,7 +256,7 @@ pub fn read_records(limit: usize) -> Vec<MetricRecord> {
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
     if out.len() > limit {
-        out = out.split_off(out.len() - limit);
+        out = out.split_off(out.len().saturating_sub(limit));
     }
     out
 }
@@ -311,17 +313,29 @@ impl Stats {
         ms.sort_unstable();
         tok.sort_unstable();
         let failures = records.iter().filter(|r| !r.ok).count();
-        let total_tokens: u64 = records.iter().map(|r| r.tokens).sum();
-        let total_actions: u64 = records.iter().map(|r| r.actions).sum();
+        let total_tokens = records
+            .iter()
+            .fold(0u64, |total, record| total.saturating_add(record.tokens));
+        let total_actions = records
+            .iter()
+            .fold(0u64, |total, record| total.saturating_add(record.actions));
+        let count = records.len();
+        let percentile_95_index = ((count as f64 * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(count.saturating_sub(1));
         Self {
-            count: records.len(),
+            count,
             failures,
-            error_rate: failures as f64 / records.len() as f64,
-            p50_ms: ms[ms.len() / 2],
-            p95_ms: ms[((ms.len() as f64 * 0.95).ceil() as usize - 1).min(ms.len() - 1)],
-            max_ms: *ms.last().unwrap(),
-            avg_ms: ms.iter().sum::<u64>() / records.len() as u64,
-            p50_tokens: tok[tok.len() / 2],
+            error_rate: failures as f64 / count as f64,
+            p50_ms: ms.get(ms.len() / 2).copied().unwrap_or_default(),
+            p95_ms: ms.get(percentile_95_index).copied().unwrap_or_default(),
+            max_ms: ms.last().copied().unwrap_or_default(),
+            avg_ms: ms
+                .iter()
+                .fold(0u64, |sum, value| sum.saturating_add(*value))
+                .checked_div(count as u64)
+                .unwrap_or_default(),
+            p50_tokens: tok.get(tok.len() / 2).copied().unwrap_or_default(),
             total_tokens,
             avg_actions: total_actions as f64 / records.len() as f64,
         }

@@ -73,7 +73,11 @@ pub async fn run(
                 let nodes = session.raw_ax_nodes().await?;
                 serde_json::to_string_pretty(&nodes)?
             }
-            _ => unreachable!("validated above"),
+            _ => {
+                return Err(flashbrowse_core::CoreError::NavigationFailed(format!(
+                    "unsupported dump format '{format}'"
+                )))
+            }
         };
         Ok::<String, flashbrowse_core::CoreError>(out)
     }
@@ -87,7 +91,7 @@ pub async fn run(
             return Err(e.into());
         }
     };
-    println!("{out}");
+    crate::write_stdout(format_args!("{out}"))?;
     let actions = if format == "axtree" || format == "axtree-nested" {
         observability::count_actions(&out)
     } else {

@@ -64,9 +64,15 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
+      - name: Extract changelog section for this tag
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" 'index($0, "## [" ver "]") == 1 { flag = 1; next } flag && index($0, "## [") == 1 { exit } flag { print }' CHANGELOG.md > RELEASE_BODY.md
+          test -s RELEASE_BODY.md
       - uses: softprops/action-gh-release@v3
         with:
           files: "*.tar.gz\n*.zip"
+          body_path: RELEASE_BODY.md
           generate_release_notes: true
           draft: false
           prerelease: false

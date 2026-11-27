@@ -7,7 +7,7 @@ description: >-
   release.
 ---
 
-# Flashbrowse Verification & Soak Runbook
+# flashbrowse Verification & Soak Runbook
 
 Run all checks sequentially on an idle machine when benchmarking or soaking.
 

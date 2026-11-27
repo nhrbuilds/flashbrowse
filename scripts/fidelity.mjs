@@ -14,6 +14,7 @@
 // manually without pretending to be a CI test.
 
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 
@@ -179,6 +180,7 @@ function analyze(rawNodes, tree) {
     missing: missing.map((item) => item.text),
     rawBytes: Buffer.byteLength(JSON.stringify(rawNodes)),
     treeBytes: Buffer.byteLength(tree),
+    treeSha256: createHash("sha256").update(tree).digest("hex"),
   };
 }
 

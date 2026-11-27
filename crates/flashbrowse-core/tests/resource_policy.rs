@@ -56,6 +56,7 @@ async fn screenshot_returns_png_after_open() {
             full_page: false,
             prepare_lazy_content: true,
             timeout_ms: 10_000,
+            ..Default::default()
         })
         .await
         .expect("screenshot");

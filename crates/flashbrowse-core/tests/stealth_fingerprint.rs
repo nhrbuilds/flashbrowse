@@ -67,8 +67,9 @@ async fn test_stealth_fingerprint() {
 
 #[tokio::test]
 async fn test_stealth_profiles_coherent_and_no_headless_chrome() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{Shutdown, TcpListener};
+    use std::time::Duration;
 
     if flashbrowse_cdp::find_chrome(None).is_err() {
         eprintln!("SKIP: no Chromium binary found");
@@ -78,15 +79,31 @@ async fn test_stealth_profiles_coherent_and_no_headless_chrome() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            let body = "<html><body><h1>profile</h1></body></html>";
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes());
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                // Drain the entire HTTP request head before replying and closing
+                // so Windows Winsock does not emit a TCP RST on unread request bytes.
+                if let Ok(cloned) = stream.try_clone() {
+                    let mut reader = BufReader::new(cloned);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        line.clear();
+                    }
+                }
+                let body = "<html><body><h1>profile</h1></body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            });
         }
     });
 

@@ -20,7 +20,7 @@ struct Check {
 }
 
 /// Run all diagnostics and print them. Returns `true` when nothing failed.
-pub async fn run(json_output: bool) -> bool {
+pub async fn run(json_output: bool) -> anyhow::Result<bool> {
     let mut checks: Vec<Check> = Vec::new();
 
     // --- browser ---------------------------------------------------------
@@ -182,30 +182,31 @@ pub async fn run(json_output: bool) -> bool {
             .iter()
             .map(|c| json!({"check": c.name, "level": c.level, "ok": c.ok, "detail": c.detail}))
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({"ok": !failed, "checks": items})).unwrap()
-        );
+        let output = serde_json::to_string_pretty(&json!({"ok": !failed, "checks": items}))?;
+        crate::write_stdout(format_args!("{output}"))?;
     } else {
-        println!("flashbrowse doctor  (v{})", env!("CARGO_PKG_VERSION"));
+        crate::write_stdout(format_args!(
+            "flashbrowse doctor  (v{})",
+            env!("CARGO_PKG_VERSION")
+        ))?;
         for c in &checks {
             let mark = match c.level {
                 "ok" => "PASS",
                 "warn" => "WARN",
                 _ => "FAIL",
             };
-            println!("  [{mark}] {:<16} {}", c.name, c.detail);
+            crate::write_stdout(format_args!("  [{mark}] {:<16} {}", c.name, c.detail))?;
         }
-        println!(
+        crate::write_stdout(format_args!(
             "\n{}",
             if failed {
                 "one or more checks failed - fix them before running agents"
             } else {
                 "all checks passed"
             }
-        );
+        ))?;
     }
-    !failed
+    Ok(!failed)
 }
 
 /// Free space in MB on the filesystem holding `path`.

@@ -49,6 +49,15 @@ pub trait BrowserDriver: Send + Sync {
     }
     /// Capture a PNG screenshot (base64).
     async fn capture_screenshot(&self, full_page: bool) -> Result<String, CoreError>;
+    /// Capture a PNG screenshot (base64) with an optional clip viewport.
+    async fn capture_screenshot_clipped(
+        &self,
+        full_page: bool,
+        clip: Option<flashbrowse_cdp::protocol::page::Viewport>,
+    ) -> Result<String, CoreError> {
+        let _ = clip;
+        self.capture_screenshot(full_page).await
+    }
 }
 
 #[async_trait]
@@ -77,5 +86,13 @@ impl BrowserDriver for CdpDriver {
 
     async fn capture_screenshot(&self, full_page: bool) -> Result<String, CoreError> {
         CdpDriver::capture_screenshot(self, full_page).await
+    }
+
+    async fn capture_screenshot_clipped(
+        &self,
+        full_page: bool,
+        clip: Option<flashbrowse_cdp::protocol::page::Viewport>,
+    ) -> Result<String, CoreError> {
+        CdpDriver::capture_screenshot_clipped(self, full_page, clip).await
     }
 }

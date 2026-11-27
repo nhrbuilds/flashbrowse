@@ -1,0 +1,41 @@
+{
+  "fixture": "framework_add_event_listener_and_react_onclick_detection",
+  "versions": {
+    "1.4.0": {
+      "Listener Div": {
+        "actionable": false,
+        "click_verified": null
+      },
+      "React Div": {
+        "actionable": false,
+        "click_verified": null
+      },
+      "Real Btn": {
+        "actionable": true,
+        "click_verified": null
+      },
+      "Not Clickable": {
+        "actionable": false,
+        "click_verified": null
+      }
+    },
+    "1.5.0": {
+      "Listener Div": {
+        "actionable": true,
+        "click_verified": true
+      },
+      "React Div": {
+        "actionable": true,
+        "click_verified": true
+      },
+      "Real Btn": {
+        "actionable": true,
+        "click_verified": null
+      },
+      "Not Clickable": {
+        "actionable": false,
+        "click_verified": null
+      }
+    }
+  }
+}

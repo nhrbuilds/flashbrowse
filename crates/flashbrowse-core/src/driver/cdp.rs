@@ -15,50 +15,58 @@ use crate::resource_policy::ResourcePolicy;
 use crate::CoreError;
 
 const CLICKABLE_NON_ARIA_SCRIPT: &str = r#"(() => {
-  const skipTags = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY', 'LABEL', 'OPTION']);
-  const out = [];
-  const walk = (root) => {
-    for (const el of root.querySelectorAll('*')) {
-      if (out.length >= 48) break;
-      if (el.shadowRoot) walk(el.shadowRoot);
+  const skipTags = new Set(['HTML', 'BODY', 'A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY', 'LABEL', 'OPTION']);
+  const direct = [];
+  const pointer = [];
+  const hasReactClick = (el) => {
+    for (const k of Object.keys(el)) {
+      if (k.startsWith('__reactProps$') && el[k] && typeof el[k].onClick === 'function') {
+        return true;
+      }
+    }
+    return false;
+  };
+  const roots = [{ elements: document.querySelectorAll('*')[Symbol.iterator](), host: null }];
+  while (roots.length) {
+      const frame = roots[roots.length - 1];
+      const next = frame.host ? { value: frame.host, done: false } : frame.elements.next();
+      if (next.done || (direct.length >= 48 && pointer.length >= 48)) {
+        roots.pop();
+        continue;
+      }
+      const el = next.value;
+      if (!frame.host && el.shadowRoot) {
+        frame.host = el;
+        roots.push({ elements: el.shadowRoot.querySelectorAll('*')[Symbol.iterator](), host: null });
+        continue;
+      }
+      frame.host = null;
       if (skipTags.has(el.tagName)) continue;
       if (el.hasAttribute('role')) continue;
-      if (!el.hasAttribute('onclick') && typeof el.onclick !== 'function') continue;
       const st = getComputedStyle(el);
       if (st.display === 'none' || st.visibility === 'hidden') continue;
       if (el.getClientRects().length === 0) continue;
-      out.push(el);
-    }
-  };
-  walk(document);
-  return out.length ? out : null;
+      if (el.hasAttribute('onclick') || typeof el.onclick === 'function' || hasReactClick(el)) {
+        if (direct.length < 48) direct.push(el);
+        continue;
+      }
+      if (pointer.length < 48 && st.cursor === 'pointer') {
+        const text = (el.innerText || el.textContent || '').trim();
+        if (!text || text.length > 120) continue;
+        const parentCursor = el.parentElement ? getComputedStyle(el.parentElement).cursor : '';
+        if (parentCursor === 'pointer') continue;
+        pointer.push(el);
+      }
+  }
+  if (!direct.length && !pointer.length) return null;
+  return { direct, pointer };
 })()"#;
 
-async fn collect_clickable_non_aria_backends(
+async fn extract_array_element_object_ids(
     client: &Arc<CdpClient>,
     session_id: &str,
-) -> HashSet<i64> {
-    let Ok(eval) = client
-        .send(
-            Some(session_id),
-            "Runtime.evaluate",
-            serde_json::json!({
-                "expression": CLICKABLE_NON_ARIA_SCRIPT,
-                "returnByValue": false,
-            }),
-        )
-        .await
-    else {
-        return HashSet::new();
-    };
-    let Some(array_object_id) = eval
-        .get("result")
-        .and_then(|r| r.get("objectId"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
-        return HashSet::new();
-    };
+    array_object_id: &str,
+) -> Vec<String> {
     let Ok(props) = client
         .send(
             Some(session_id),
@@ -70,9 +78,9 @@ async fn collect_clickable_non_aria_backends(
         )
         .await
     else {
-        return HashSet::new();
+        return Vec::new();
     };
-    let elem_ids: Vec<String> = props
+    props
         .get("result")
         .and_then(Value::as_array)
         .into_iter()
@@ -90,8 +98,148 @@ async fn collect_clickable_non_aria_backends(
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })
-        .collect();
-    let backends: Vec<i64> = stream::iter(elem_ids)
+        .collect()
+}
+
+async fn has_click_event_listener(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+    object_id: &str,
+) -> bool {
+    let Ok(resp) = client
+        .send(
+            Some(session_id),
+            "DOMDebugger.getEventListeners",
+            serde_json::json!({
+                "objectId": object_id,
+                "depth": 1,
+                "pierce": false,
+            }),
+        )
+        .await
+    else {
+        return false;
+    };
+    resp.get("listeners")
+        .and_then(Value::as_array)
+        .is_some_and(|list| {
+            list.iter().any(|l| {
+                matches!(
+                    l.get("type").and_then(Value::as_str),
+                    Some("click" | "mousedown" | "pointerdown")
+                )
+            })
+        })
+}
+
+async fn collect_clickable_non_aria_backends(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+) -> HashSet<i64> {
+    let backends = collect_clickable_non_aria_backends_inner(client, session_id).await;
+    // Release the group unconditionally: every early return inside the inner
+    // helper would otherwise leave V8 remote objects alive until navigation.
+    let _ = client
+        .send(
+            Some(session_id),
+            "Runtime.releaseObjectGroup",
+            serde_json::json!({ "objectGroup": "fb-clickables" }),
+        )
+        .await;
+    backends
+}
+
+async fn collect_clickable_non_aria_backends_inner(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+) -> HashSet<i64> {
+    const OBJECT_GROUP: &str = "fb-clickables";
+    let Ok(eval) = client
+        .send(
+            Some(session_id),
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": CLICKABLE_NON_ARIA_SCRIPT,
+                "returnByValue": false,
+                "objectGroup": OBJECT_GROUP,
+            }),
+        )
+        .await
+    else {
+        return HashSet::new();
+    };
+    let Some(root_object_id) = eval
+        .get("result")
+        .and_then(|r| r.get("objectId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return HashSet::new();
+    };
+    let Ok(root_props) = client
+        .send(
+            Some(session_id),
+            "Runtime.getProperties",
+            serde_json::json!({
+                "objectId": root_object_id,
+                "ownProperties": true,
+            }),
+        )
+        .await
+    else {
+        return HashSet::new();
+    };
+    let mut direct_arr_id: Option<String> = None;
+    let mut pointer_arr_id: Option<String> = None;
+    for entry in root_props
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = entry.get("name").and_then(Value::as_str);
+        let oid = entry
+            .get("value")
+            .and_then(|v| v.get("objectId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match name {
+            Some("direct") => direct_arr_id = oid,
+            Some("pointer") => pointer_arr_id = oid,
+            _ => {}
+        }
+    }
+
+    let mut confirmed_ids = if let Some(ref oid) = direct_arr_id {
+        extract_array_element_object_ids(client, session_id, oid).await
+    } else {
+        Vec::new()
+    };
+
+    if let Some(ref oid) = pointer_arr_id {
+        let pointer_ids = extract_array_element_object_ids(client, session_id, oid).await;
+        if !pointer_ids.is_empty() {
+            let verified: Vec<String> = stream::iter(pointer_ids)
+                .map(|elem_oid| {
+                    let client = client.clone();
+                    let sid = session_id.to_string();
+                    async move {
+                        if has_click_event_listener(&client, &sid, &elem_oid).await {
+                            Some(elem_oid)
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .buffer_unordered(8)
+                .filter_map(|opt| async move { opt })
+                .collect()
+                .await;
+            confirmed_ids.extend(verified);
+        }
+    }
+
+    let backends: Vec<i64> = stream::iter(confirmed_ids)
         .map(|object_id| {
             let client = client.clone();
             let sid = session_id.to_string();
@@ -114,13 +262,6 @@ async fn collect_clickable_non_aria_backends(
         .buffer_unordered(8)
         .filter_map(|b| async move { b })
         .collect()
-        .await;
-    let _ = client
-        .send(
-            Some(session_id),
-            "Runtime.releaseObject",
-            serde_json::json!({ "objectId": array_object_id }),
-        )
         .await;
     backends.into_iter().collect()
 }
@@ -162,6 +303,11 @@ impl CdpDriver {
 
     pub async fn evaluate(&self, expression: &str) -> Result<Value, CoreError> {
         let r = runtime::evaluate(&self.client, &self.session_id, expression).await?;
+        if let Some(details) = r.exception_details {
+            return Err(CoreError::NavigationFailed(format!(
+                "page evaluation failed: {details}"
+            )));
+        }
         Ok(r.result.value.unwrap_or(Value::Null))
     }
 
@@ -257,7 +403,7 @@ impl CdpDriver {
             if frame.nodes.is_empty() {
                 continue;
             }
-            let prefix = format!("f{}:", frame.idx + 1);
+            let prefix = format!("f{}:", frame.idx.saturating_add(1));
             if let Some(sid) = frame.oopif_sid {
                 let fs = FrameSession {
                     session_id: sid,
@@ -321,6 +467,17 @@ impl CdpDriver {
 
     pub async fn capture_screenshot(&self, full_page: bool) -> Result<String, CoreError> {
         let resp = page::capture_screenshot(&self.client, &self.session_id, full_page).await?;
+        Ok(resp.data)
+    }
+
+    pub async fn capture_screenshot_clipped(
+        &self,
+        full_page: bool,
+        clip: Option<page::Viewport>,
+    ) -> Result<String, CoreError> {
+        let resp =
+            page::capture_screenshot_clipped(&self.client, &self.session_id, full_page, clip)
+                .await?;
         Ok(resp.data)
     }
 }

@@ -14,14 +14,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
-regex = { workspace = true }
 which = { workspace = true }
 reqwest = { workspace = true }
 
-# Only used for process-group and parent-death handling on unix; declaring it
-# for every target would be an unused dependency on Windows.
+# Safe process-group signaling for owned Chromium trees.
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+win-handles-sys = "0.1.1"
 
 [dev-dependencies]
 anyhow = { workspace = true }

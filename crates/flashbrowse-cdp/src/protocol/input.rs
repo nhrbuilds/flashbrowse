@@ -16,6 +16,8 @@ pub struct DispatchMouseEventParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub button: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub buttons: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub click_count: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_x: Option<f64>,

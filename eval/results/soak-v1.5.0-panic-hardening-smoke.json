@@ -1,0 +1,2037 @@
+{
+  "startedAt": "2026-11-27T01:21:05.563Z",
+  "durationSec": 301,
+  "minutes": 5,
+  "urls": [
+    "http://127.0.0.1:8099/index.html",
+    "https://example.com"
+  ],
+  "iterations": 243,
+  "toolCalls": 863,
+  "throughput_per_sec": 2.87,
+  "overall": {
+    "n": 863,
+    "errors": 0,
+    "p50_ms": 39,
+    "p95_ms": 1356,
+    "max_ms": 1436,
+    "p50_tokens": 231,
+    "total_tokens": 585325
+  },
+  "drift": {
+    "first_tenth_p50_ms": 40,
+    "last_tenth_p50_ms": 39,
+    "drift_ratio": 0.975,
+    "first_tenth_p95_ms": 1354,
+    "last_tenth_p95_ms": 1355
+  },
+  "perTool": {
+    "browser_open": {
+      "n": 243,
+      "errors": 0,
+      "p50_ms": 770,
+      "p95_ms": 1359,
+      "max_ms": 1436,
+      "p50_tokens": 1317,
+      "total_tokens": 185479
+    },
+    "browser_act": {
+      "n": 365,
+      "errors": 0,
+      "p50_ms": 39,
+      "p95_ms": 52,
+      "max_ms": 79,
+      "p50_tokens": 1317,
+      "total_tokens": 346153
+    },
+    "browser_extract_markdown": {
+      "n": 243,
+      "errors": 0,
+      "p50_ms": 1,
+      "p95_ms": 2,
+      "max_ms": 5,
+      "p50_tokens": 211,
+      "total_tokens": 53693
+    },
+    "browser_screenshot": {
+      "n": 12,
+      "errors": 0,
+      "p50_ms": 197,
+      "p95_ms": 199,
+      "max_ms": 199,
+      "p50_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "memory": {
+    "rss_flashbrowse_start_kb": 15588,
+    "rss_flashbrowse_end_kb": 16816,
+    "rss_chrome_start_kb": 1337520,
+    "rss_chrome_end_kb": 2057344,
+    "chrome_processes_end": 0,
+    "leak_gate": {
+      "ok": true,
+      "evaluated": true,
+      "warmup_sec": 60,
+      "window_sec": 60,
+      "cold_start_kb": 15588,
+      "baseline_kb": 16616,
+      "end_kb": 16772,
+      "growth_kb": 156,
+      "ratio": 1.009,
+      "slope_kb_per_hour": 2014,
+      "trend_r2": 0.191,
+      "projected_kb_1h": 18786,
+      "ratio_fail": false,
+      "trend_fail": false
+    }
+  },
+  "errors": [],
+  "errorCount": 0,
+  "timeline": [
+    {
+      "t": 1,
+      "iteration": 1,
+      "samples": 4,
+      "chrome": 13,
+      "rssFb": 15588,
+      "rssChrome": 1337520
+    },
+    {
+      "t": 3,
+      "iteration": 2,
+      "samples": 7,
+      "chrome": 14,
+      "rssFb": 15588,
+      "rssChrome": 1517676
+    },
+    {
+      "t": 4,
+      "iteration": 3,
+      "samples": 11,
+      "chrome": 15,
+      "rssFb": 15588,
+      "rssChrome": 1661464
+    },
+    {
+      "t": 5,
+      "iteration": 4,
+      "samples": 14,
+      "chrome": 16,
+      "rssFb": 15588,
+      "rssChrome": 1798340
+    },
+    {
+      "t": 6,
+      "iteration": 5,
+      "samples": 18,
+      "chrome": 17,
+      "rssFb": 15584,
+      "rssChrome": 1933508
+    },
+    {
+      "t": 8,
+      "iteration": 6,
+      "samples": 21,
+      "chrome": 18,
+      "rssFb": 15584,
+      "rssChrome": 2068236
+    },
+    {
+      "t": 8,
+      "iteration": 7,
+      "samples": 25,
+      "chrome": 19,
+      "rssFb": 15584,
+      "rssChrome": 2201840
+    },
+    {
+      "t": 10,
+      "iteration": 8,
+      "samples": 28,
+      "chrome": 19,
+      "rssFb": 15584,
+      "rssChrome": 2202764
+    },
+    {
+      "t": 11,
+      "iteration": 9,
+      "samples": 32,
+      "chrome": 19,
+      "rssFb": 15808,
+      "rssChrome": 2200536
+    },
+    {
+      "t": 13,
+      "iteration": 10,
+      "samples": 35,
+      "chrome": 19,
+      "rssFb": 15808,
+      "rssChrome": 2201300
+    },
+    {
+      "t": 13,
+      "iteration": 11,
+      "samples": 39,
+      "chrome": 19,
+      "rssFb": 15808,
+      "rssChrome": 2201884
+    },
+    {
+      "t": 15,
+      "iteration": 12,
+      "samples": 42,
+      "chrome": 19,
+      "rssFb": 15812,
+      "rssChrome": 2202620
+    },
+    {
+      "t": 16,
+      "iteration": 13,
+      "samples": 46,
+      "chrome": 18,
+      "rssFb": 16056,
+      "rssChrome": 2099776
+    },
+    {
+      "t": 17,
+      "iteration": 14,
+      "samples": 49,
+      "chrome": 18,
+      "rssFb": 16056,
+      "rssChrome": 2100360
+    },
+    {
+      "t": 18,
+      "iteration": 15,
+      "samples": 53,
+      "chrome": 18,
+      "rssFb": 15964,
+      "rssChrome": 2099264
+    },
+    {
+      "t": 20,
+      "iteration": 16,
+      "samples": 56,
+      "chrome": 18,
+      "rssFb": 15892,
+      "rssChrome": 2099892
+    },
+    {
+      "t": 21,
+      "iteration": 17,
+      "samples": 60,
+      "chrome": 18,
+      "rssFb": 15892,
+      "rssChrome": 2099320
+    },
+    {
+      "t": 22,
+      "iteration": 18,
+      "samples": 63,
+      "chrome": 18,
+      "rssFb": 15892,
+      "rssChrome": 2100004
+    },
+    {
+      "t": 23,
+      "iteration": 19,
+      "samples": 67,
+      "chrome": 18,
+      "rssFb": 15900,
+      "rssChrome": 2099616
+    },
+    {
+      "t": 25,
+      "iteration": 20,
+      "samples": 71,
+      "chrome": 18,
+      "rssFb": 15900,
+      "rssChrome": 2103880
+    },
+    {
+      "t": 26,
+      "iteration": 21,
+      "samples": 75,
+      "chrome": 18,
+      "rssFb": 15908,
+      "rssChrome": 2099600
+    },
+    {
+      "t": 27,
+      "iteration": 22,
+      "samples": 78,
+      "chrome": 18,
+      "rssFb": 15908,
+      "rssChrome": 2102580
+    },
+    {
+      "t": 28,
+      "iteration": 23,
+      "samples": 82,
+      "chrome": 18,
+      "rssFb": 16020,
+      "rssChrome": 2102352
+    },
+    {
+      "t": 30,
+      "iteration": 24,
+      "samples": 85,
+      "chrome": 18,
+      "rssFb": 16020,
+      "rssChrome": 2102416
+    },
+    {
+      "t": 31,
+      "iteration": 25,
+      "samples": 89,
+      "chrome": 17,
+      "rssFb": 16000,
+      "rssChrome": 2005956
+    },
+    {
+      "t": 32,
+      "iteration": 26,
+      "samples": 92,
+      "chrome": 17,
+      "rssFb": 16000,
+      "rssChrome": 2009876
+    },
+    {
+      "t": 33,
+      "iteration": 27,
+      "samples": 96,
+      "chrome": 17,
+      "rssFb": 15964,
+      "rssChrome": 2007804
+    },
+    {
+      "t": 35,
+      "iteration": 28,
+      "samples": 99,
+      "chrome": 17,
+      "rssFb": 15964,
+      "rssChrome": 2008752
+    },
+    {
+      "t": 36,
+      "iteration": 29,
+      "samples": 103,
+      "chrome": 17,
+      "rssFb": 16396,
+      "rssChrome": 2008192
+    },
+    {
+      "t": 37,
+      "iteration": 30,
+      "samples": 106,
+      "chrome": 17,
+      "rssFb": 16008,
+      "rssChrome": 2008668
+    },
+    {
+      "t": 38,
+      "iteration": 31,
+      "samples": 110,
+      "chrome": 17,
+      "rssFb": 16064,
+      "rssChrome": 2008876
+    },
+    {
+      "t": 40,
+      "iteration": 32,
+      "samples": 113,
+      "chrome": 17,
+      "rssFb": 16064,
+      "rssChrome": 2009392
+    },
+    {
+      "t": 40,
+      "iteration": 33,
+      "samples": 117,
+      "chrome": 17,
+      "rssFb": 16052,
+      "rssChrome": 2008756
+    },
+    {
+      "t": 42,
+      "iteration": 34,
+      "samples": 120,
+      "chrome": 17,
+      "rssFb": 16052,
+      "rssChrome": 2009072
+    },
+    {
+      "t": 43,
+      "iteration": 35,
+      "samples": 124,
+      "chrome": 17,
+      "rssFb": 16052,
+      "rssChrome": 2008156
+    },
+    {
+      "t": 45,
+      "iteration": 36,
+      "samples": 127,
+      "chrome": 17,
+      "rssFb": 16052,
+      "rssChrome": 2008320
+    },
+    {
+      "t": 45,
+      "iteration": 37,
+      "samples": 131,
+      "chrome": 17,
+      "rssFb": 16436,
+      "rssChrome": 2008692
+    },
+    {
+      "t": 47,
+      "iteration": 38,
+      "samples": 134,
+      "chrome": 17,
+      "rssFb": 16144,
+      "rssChrome": 2009812
+    },
+    {
+      "t": 48,
+      "iteration": 39,
+      "samples": 138,
+      "chrome": 17,
+      "rssFb": 16240,
+      "rssChrome": 2009188
+    },
+    {
+      "t": 50,
+      "iteration": 40,
+      "samples": 142,
+      "chrome": 17,
+      "rssFb": 16248,
+      "rssChrome": 2013272
+    },
+    {
+      "t": 50,
+      "iteration": 41,
+      "samples": 146,
+      "chrome": 17,
+      "rssFb": 16560,
+      "rssChrome": 2008800
+    },
+    {
+      "t": 52,
+      "iteration": 42,
+      "samples": 149,
+      "chrome": 17,
+      "rssFb": 16560,
+      "rssChrome": 2007600
+    },
+    {
+      "t": 53,
+      "iteration": 43,
+      "samples": 153,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2007056
+    },
+    {
+      "t": 55,
+      "iteration": 44,
+      "samples": 156,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2009928
+    },
+    {
+      "t": 55,
+      "iteration": 45,
+      "samples": 160,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2008916
+    },
+    {
+      "t": 57,
+      "iteration": 46,
+      "samples": 163,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2010220
+    },
+    {
+      "t": 58,
+      "iteration": 47,
+      "samples": 167,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2009468
+    },
+    {
+      "t": 59,
+      "iteration": 48,
+      "samples": 170,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2009848
+    },
+    {
+      "t": 60,
+      "iteration": 49,
+      "samples": 174,
+      "chrome": 17,
+      "rssFb": 16592,
+      "rssChrome": 2008480
+    },
+    {
+      "t": 62,
+      "iteration": 50,
+      "samples": 177,
+      "chrome": 17,
+      "rssFb": 16592,
+      "rssChrome": 2015316
+    },
+    {
+      "t": 63,
+      "iteration": 51,
+      "samples": 181,
+      "chrome": 17,
+      "rssFb": 16548,
+      "rssChrome": 2010852
+    },
+    {
+      "t": 64,
+      "iteration": 52,
+      "samples": 184,
+      "chrome": 17,
+      "rssFb": 16548,
+      "rssChrome": 2009140
+    },
+    {
+      "t": 65,
+      "iteration": 53,
+      "samples": 188,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2010388
+    },
+    {
+      "t": 67,
+      "iteration": 54,
+      "samples": 191,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2017024
+    },
+    {
+      "t": 68,
+      "iteration": 55,
+      "samples": 195,
+      "chrome": 17,
+      "rssFb": 16936,
+      "rssChrome": 2016288
+    },
+    {
+      "t": 69,
+      "iteration": 56,
+      "samples": 198,
+      "chrome": 17,
+      "rssFb": 16936,
+      "rssChrome": 2012364
+    },
+    {
+      "t": 70,
+      "iteration": 57,
+      "samples": 202,
+      "chrome": 17,
+      "rssFb": 16936,
+      "rssChrome": 2012960
+    },
+    {
+      "t": 72,
+      "iteration": 58,
+      "samples": 205,
+      "chrome": 17,
+      "rssFb": 16936,
+      "rssChrome": 2011860
+    },
+    {
+      "t": 73,
+      "iteration": 59,
+      "samples": 209,
+      "chrome": 17,
+      "rssFb": 16644,
+      "rssChrome": 2010004
+    },
+    {
+      "t": 74,
+      "iteration": 60,
+      "samples": 213,
+      "chrome": 17,
+      "rssFb": 16644,
+      "rssChrome": 2016312
+    },
+    {
+      "t": 75,
+      "iteration": 61,
+      "samples": 217,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2011556
+    },
+    {
+      "t": 77,
+      "iteration": 62,
+      "samples": 220,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2011240
+    },
+    {
+      "t": 78,
+      "iteration": 63,
+      "samples": 224,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2010296
+    },
+    {
+      "t": 79,
+      "iteration": 64,
+      "samples": 227,
+      "chrome": 17,
+      "rssFb": 16588,
+      "rssChrome": 2011172
+    },
+    {
+      "t": 80,
+      "iteration": 65,
+      "samples": 231,
+      "chrome": 17,
+      "rssFb": 16604,
+      "rssChrome": 2010160
+    },
+    {
+      "t": 82,
+      "iteration": 66,
+      "samples": 234,
+      "chrome": 17,
+      "rssFb": 16604,
+      "rssChrome": 2014204
+    },
+    {
+      "t": 83,
+      "iteration": 67,
+      "samples": 238,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2037064
+    },
+    {
+      "t": 84,
+      "iteration": 68,
+      "samples": 241,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2040140
+    },
+    {
+      "t": 85,
+      "iteration": 69,
+      "samples": 245,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2042380
+    },
+    {
+      "t": 87,
+      "iteration": 70,
+      "samples": 248,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2041360
+    },
+    {
+      "t": 88,
+      "iteration": 71,
+      "samples": 252,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2041100
+    },
+    {
+      "t": 89,
+      "iteration": 72,
+      "samples": 255,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2053572
+    },
+    {
+      "t": 90,
+      "iteration": 73,
+      "samples": 259,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2053104
+    },
+    {
+      "t": 92,
+      "iteration": 74,
+      "samples": 262,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2056452
+    },
+    {
+      "t": 93,
+      "iteration": 75,
+      "samples": 266,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2051368
+    },
+    {
+      "t": 94,
+      "iteration": 76,
+      "samples": 269,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2054648
+    },
+    {
+      "t": 95,
+      "iteration": 77,
+      "samples": 273,
+      "chrome": 17,
+      "rssFb": 16604,
+      "rssChrome": 2054140
+    },
+    {
+      "t": 97,
+      "iteration": 78,
+      "samples": 276,
+      "chrome": 17,
+      "rssFb": 16604,
+      "rssChrome": 2053776
+    },
+    {
+      "t": 97,
+      "iteration": 79,
+      "samples": 280,
+      "chrome": 17,
+      "rssFb": 16624,
+      "rssChrome": 2053824
+    },
+    {
+      "t": 99,
+      "iteration": 80,
+      "samples": 284,
+      "chrome": 17,
+      "rssFb": 16624,
+      "rssChrome": 2057592
+    },
+    {
+      "t": 100,
+      "iteration": 81,
+      "samples": 288,
+      "chrome": 17,
+      "rssFb": 16640,
+      "rssChrome": 2051780
+    },
+    {
+      "t": 102,
+      "iteration": 82,
+      "samples": 291,
+      "chrome": 17,
+      "rssFb": 16640,
+      "rssChrome": 2054208
+    },
+    {
+      "t": 103,
+      "iteration": 83,
+      "samples": 295,
+      "chrome": 17,
+      "rssFb": 16620,
+      "rssChrome": 2053156
+    },
+    {
+      "t": 104,
+      "iteration": 84,
+      "samples": 298,
+      "chrome": 17,
+      "rssFb": 16620,
+      "rssChrome": 2053744
+    },
+    {
+      "t": 105,
+      "iteration": 85,
+      "samples": 302,
+      "chrome": 17,
+      "rssFb": 16656,
+      "rssChrome": 2053404
+    },
+    {
+      "t": 107,
+      "iteration": 86,
+      "samples": 305,
+      "chrome": 17,
+      "rssFb": 16656,
+      "rssChrome": 2054580
+    },
+    {
+      "t": 107,
+      "iteration": 87,
+      "samples": 309,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2053184
+    },
+    {
+      "t": 109,
+      "iteration": 88,
+      "samples": 312,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2053208
+    },
+    {
+      "t": 110,
+      "iteration": 89,
+      "samples": 316,
+      "chrome": 17,
+      "rssFb": 16620,
+      "rssChrome": 2053768
+    },
+    {
+      "t": 112,
+      "iteration": 90,
+      "samples": 319,
+      "chrome": 17,
+      "rssFb": 16620,
+      "rssChrome": 2054300
+    },
+    {
+      "t": 112,
+      "iteration": 91,
+      "samples": 323,
+      "chrome": 17,
+      "rssFb": 16560,
+      "rssChrome": 2052584
+    },
+    {
+      "t": 114,
+      "iteration": 92,
+      "samples": 326,
+      "chrome": 17,
+      "rssFb": 16560,
+      "rssChrome": 2052976
+    },
+    {
+      "t": 115,
+      "iteration": 93,
+      "samples": 330,
+      "chrome": 17,
+      "rssFb": 16596,
+      "rssChrome": 2055184
+    },
+    {
+      "t": 116,
+      "iteration": 94,
+      "samples": 333,
+      "chrome": 17,
+      "rssFb": 16596,
+      "rssChrome": 2056464
+    },
+    {
+      "t": 117,
+      "iteration": 95,
+      "samples": 337,
+      "chrome": 17,
+      "rssFb": 16596,
+      "rssChrome": 2056980
+    },
+    {
+      "t": 119,
+      "iteration": 96,
+      "samples": 340,
+      "chrome": 17,
+      "rssFb": 16596,
+      "rssChrome": 2057996
+    },
+    {
+      "t": 120,
+      "iteration": 97,
+      "samples": 344,
+      "chrome": 17,
+      "rssFb": 16748,
+      "rssChrome": 2056820
+    },
+    {
+      "t": 121,
+      "iteration": 98,
+      "samples": 347,
+      "chrome": 17,
+      "rssFb": 16748,
+      "rssChrome": 2057008
+    },
+    {
+      "t": 122,
+      "iteration": 99,
+      "samples": 351,
+      "chrome": 17,
+      "rssFb": 16680,
+      "rssChrome": 2056600
+    },
+    {
+      "t": 124,
+      "iteration": 100,
+      "samples": 355,
+      "chrome": 17,
+      "rssFb": 16680,
+      "rssChrome": 2057636
+    },
+    {
+      "t": 125,
+      "iteration": 101,
+      "samples": 359,
+      "chrome": 17,
+      "rssFb": 16680,
+      "rssChrome": 2051880
+    },
+    {
+      "t": 126,
+      "iteration": 102,
+      "samples": 362,
+      "chrome": 17,
+      "rssFb": 16680,
+      "rssChrome": 2055456
+    },
+    {
+      "t": 127,
+      "iteration": 103,
+      "samples": 366,
+      "chrome": 17,
+      "rssFb": 17016,
+      "rssChrome": 2055552
+    },
+    {
+      "t": 129,
+      "iteration": 104,
+      "samples": 369,
+      "chrome": 17,
+      "rssFb": 17016,
+      "rssChrome": 2055560
+    },
+    {
+      "t": 130,
+      "iteration": 105,
+      "samples": 373,
+      "chrome": 17,
+      "rssFb": 17016,
+      "rssChrome": 2055704
+    },
+    {
+      "t": 131,
+      "iteration": 106,
+      "samples": 376,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2057140
+    },
+    {
+      "t": 132,
+      "iteration": 107,
+      "samples": 380,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2054868
+    },
+    {
+      "t": 134,
+      "iteration": 108,
+      "samples": 383,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2056592
+    },
+    {
+      "t": 135,
+      "iteration": 109,
+      "samples": 387,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2055856
+    },
+    {
+      "t": 136,
+      "iteration": 110,
+      "samples": 390,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2053044
+    },
+    {
+      "t": 137,
+      "iteration": 111,
+      "samples": 394,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2054792
+    },
+    {
+      "t": 139,
+      "iteration": 112,
+      "samples": 397,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2057264
+    },
+    {
+      "t": 140,
+      "iteration": 113,
+      "samples": 401,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2056576
+    },
+    {
+      "t": 141,
+      "iteration": 114,
+      "samples": 404,
+      "chrome": 17,
+      "rssFb": 16716,
+      "rssChrome": 2054084
+    },
+    {
+      "t": 142,
+      "iteration": 115,
+      "samples": 408,
+      "chrome": 17,
+      "rssFb": 16696,
+      "rssChrome": 2054904
+    },
+    {
+      "t": 144,
+      "iteration": 116,
+      "samples": 411,
+      "chrome": 17,
+      "rssFb": 16696,
+      "rssChrome": 2057292
+    },
+    {
+      "t": 144,
+      "iteration": 117,
+      "samples": 415,
+      "chrome": 17,
+      "rssFb": 16656,
+      "rssChrome": 2055920
+    },
+    {
+      "t": 146,
+      "iteration": 118,
+      "samples": 418,
+      "chrome": 17,
+      "rssFb": 16656,
+      "rssChrome": 2057520
+    },
+    {
+      "t": 147,
+      "iteration": 119,
+      "samples": 422,
+      "chrome": 17,
+      "rssFb": 16672,
+      "rssChrome": 2056588
+    },
+    {
+      "t": 149,
+      "iteration": 120,
+      "samples": 426,
+      "chrome": 17,
+      "rssFb": 16672,
+      "rssChrome": 2061784
+    },
+    {
+      "t": 150,
+      "iteration": 121,
+      "samples": 430,
+      "chrome": 17,
+      "rssFb": 16672,
+      "rssChrome": 2057624
+    },
+    {
+      "t": 151,
+      "iteration": 122,
+      "samples": 433,
+      "chrome": 17,
+      "rssFb": 16672,
+      "rssChrome": 2057764
+    },
+    {
+      "t": 152,
+      "iteration": 123,
+      "samples": 437,
+      "chrome": 17,
+      "rssFb": 16688,
+      "rssChrome": 2056772
+    },
+    {
+      "t": 154,
+      "iteration": 124,
+      "samples": 440,
+      "chrome": 17,
+      "rssFb": 16688,
+      "rssChrome": 2056432
+    },
+    {
+      "t": 154,
+      "iteration": 125,
+      "samples": 444,
+      "chrome": 17,
+      "rssFb": 16636,
+      "rssChrome": 2056928
+    },
+    {
+      "t": 156,
+      "iteration": 126,
+      "samples": 447,
+      "chrome": 17,
+      "rssFb": 16636,
+      "rssChrome": 2056848
+    },
+    {
+      "t": 157,
+      "iteration": 127,
+      "samples": 451,
+      "chrome": 17,
+      "rssFb": 16604,
+      "rssChrome": 2056976
+    },
+    {
+      "t": 159,
+      "iteration": 128,
+      "samples": 454,
+      "chrome": 17,
+      "rssFb": 16604,
+      "rssChrome": 2057764
+    },
+    {
+      "t": 159,
+      "iteration": 129,
+      "samples": 458,
+      "chrome": 17,
+      "rssFb": 16664,
+      "rssChrome": 2056576
+    },
+    {
+      "t": 161,
+      "iteration": 130,
+      "samples": 461,
+      "chrome": 17,
+      "rssFb": 16664,
+      "rssChrome": 2056360
+    },
+    {
+      "t": 162,
+      "iteration": 131,
+      "samples": 465,
+      "chrome": 17,
+      "rssFb": 16612,
+      "rssChrome": 2057180
+    },
+    {
+      "t": 163,
+      "iteration": 132,
+      "samples": 468,
+      "chrome": 17,
+      "rssFb": 16612,
+      "rssChrome": 2058396
+    },
+    {
+      "t": 164,
+      "iteration": 133,
+      "samples": 472,
+      "chrome": 17,
+      "rssFb": 16996,
+      "rssChrome": 2056696
+    },
+    {
+      "t": 166,
+      "iteration": 134,
+      "samples": 475,
+      "chrome": 17,
+      "rssFb": 16996,
+      "rssChrome": 2058616
+    },
+    {
+      "t": 167,
+      "iteration": 135,
+      "samples": 479,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2057216
+    },
+    {
+      "t": 168,
+      "iteration": 136,
+      "samples": 482,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2055088
+    },
+    {
+      "t": 169,
+      "iteration": 137,
+      "samples": 486,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2055224
+    },
+    {
+      "t": 171,
+      "iteration": 138,
+      "samples": 489,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2057052
+    },
+    {
+      "t": 172,
+      "iteration": 139,
+      "samples": 493,
+      "chrome": 17,
+      "rssFb": 16632,
+      "rssChrome": 2056096
+    },
+    {
+      "t": 173,
+      "iteration": 140,
+      "samples": 497,
+      "chrome": 17,
+      "rssFb": 16636,
+      "rssChrome": 2060868
+    },
+    {
+      "t": 174,
+      "iteration": 141,
+      "samples": 501,
+      "chrome": 17,
+      "rssFb": 16644,
+      "rssChrome": 2056232
+    },
+    {
+      "t": 176,
+      "iteration": 142,
+      "samples": 504,
+      "chrome": 17,
+      "rssFb": 16644,
+      "rssChrome": 2057448
+    },
+    {
+      "t": 177,
+      "iteration": 143,
+      "samples": 508,
+      "chrome": 17,
+      "rssFb": 16644,
+      "rssChrome": 2055496
+    },
+    {
+      "t": 178,
+      "iteration": 144,
+      "samples": 511,
+      "chrome": 17,
+      "rssFb": 16644,
+      "rssChrome": 2057964
+    },
+    {
+      "t": 179,
+      "iteration": 145,
+      "samples": 515,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2056872
+    },
+    {
+      "t": 181,
+      "iteration": 146,
+      "samples": 518,
+      "chrome": 18,
+      "rssFb": 16684,
+      "rssChrome": 2181176
+    },
+    {
+      "t": 182,
+      "iteration": 147,
+      "samples": 522,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2056148
+    },
+    {
+      "t": 183,
+      "iteration": 148,
+      "samples": 525,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2058676
+    },
+    {
+      "t": 184,
+      "iteration": 149,
+      "samples": 529,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2056260
+    },
+    {
+      "t": 186,
+      "iteration": 150,
+      "samples": 532,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2058620
+    },
+    {
+      "t": 187,
+      "iteration": 151,
+      "samples": 536,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2057700
+    },
+    {
+      "t": 188,
+      "iteration": 152,
+      "samples": 539,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2057936
+    },
+    {
+      "t": 189,
+      "iteration": 153,
+      "samples": 543,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2057536
+    },
+    {
+      "t": 191,
+      "iteration": 154,
+      "samples": 546,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2057812
+    },
+    {
+      "t": 192,
+      "iteration": 155,
+      "samples": 550,
+      "chrome": 17,
+      "rssFb": 16660,
+      "rssChrome": 2058204
+    },
+    {
+      "t": 193,
+      "iteration": 156,
+      "samples": 553,
+      "chrome": 17,
+      "rssFb": 16660,
+      "rssChrome": 2058560
+    },
+    {
+      "t": 194,
+      "iteration": 157,
+      "samples": 557,
+      "chrome": 17,
+      "rssFb": 16660,
+      "rssChrome": 2058036
+    },
+    {
+      "t": 196,
+      "iteration": 158,
+      "samples": 560,
+      "chrome": 17,
+      "rssFb": 16660,
+      "rssChrome": 2058680
+    },
+    {
+      "t": 196,
+      "iteration": 159,
+      "samples": 564,
+      "chrome": 17,
+      "rssFb": 16688,
+      "rssChrome": 2057044
+    },
+    {
+      "t": 198,
+      "iteration": 160,
+      "samples": 568,
+      "chrome": 17,
+      "rssFb": 16688,
+      "rssChrome": 2062292
+    },
+    {
+      "t": 199,
+      "iteration": 161,
+      "samples": 572,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2056592
+    },
+    {
+      "t": 201,
+      "iteration": 162,
+      "samples": 575,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2055316
+    },
+    {
+      "t": 202,
+      "iteration": 163,
+      "samples": 579,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2055484
+    },
+    {
+      "t": 203,
+      "iteration": 164,
+      "samples": 582,
+      "chrome": 17,
+      "rssFb": 16700,
+      "rssChrome": 2058424
+    },
+    {
+      "t": 204,
+      "iteration": 165,
+      "samples": 586,
+      "chrome": 17,
+      "rssFb": 16704,
+      "rssChrome": 2056892
+    },
+    {
+      "t": 206,
+      "iteration": 166,
+      "samples": 589,
+      "chrome": 17,
+      "rssFb": 16704,
+      "rssChrome": 2058024
+    },
+    {
+      "t": 206,
+      "iteration": 167,
+      "samples": 593,
+      "chrome": 17,
+      "rssFb": 16704,
+      "rssChrome": 2057204
+    },
+    {
+      "t": 208,
+      "iteration": 168,
+      "samples": 596,
+      "chrome": 17,
+      "rssFb": 16704,
+      "rssChrome": 2056396
+    },
+    {
+      "t": 209,
+      "iteration": 169,
+      "samples": 600,
+      "chrome": 17,
+      "rssFb": 16724,
+      "rssChrome": 2056792
+    },
+    {
+      "t": 211,
+      "iteration": 170,
+      "samples": 603,
+      "chrome": 17,
+      "rssFb": 16724,
+      "rssChrome": 2058204
+    },
+    {
+      "t": 211,
+      "iteration": 171,
+      "samples": 607,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2057048
+    },
+    {
+      "t": 213,
+      "iteration": 172,
+      "samples": 610,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2056756
+    },
+    {
+      "t": 214,
+      "iteration": 173,
+      "samples": 614,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2056992
+    },
+    {
+      "t": 215,
+      "iteration": 174,
+      "samples": 617,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2056208
+    },
+    {
+      "t": 216,
+      "iteration": 175,
+      "samples": 621,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2054816
+    },
+    {
+      "t": 218,
+      "iteration": 176,
+      "samples": 624,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2058348
+    },
+    {
+      "t": 219,
+      "iteration": 177,
+      "samples": 628,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2057128
+    },
+    {
+      "t": 220,
+      "iteration": 178,
+      "samples": 631,
+      "chrome": 17,
+      "rssFb": 16732,
+      "rssChrome": 2057180
+    },
+    {
+      "t": 221,
+      "iteration": 179,
+      "samples": 635,
+      "chrome": 17,
+      "rssFb": 16676,
+      "rssChrome": 2056540
+    },
+    {
+      "t": 223,
+      "iteration": 180,
+      "samples": 639,
+      "chrome": 17,
+      "rssFb": 16676,
+      "rssChrome": 2061600
+    },
+    {
+      "t": 224,
+      "iteration": 181,
+      "samples": 643,
+      "chrome": 17,
+      "rssFb": 16680,
+      "rssChrome": 2058216
+    },
+    {
+      "t": 225,
+      "iteration": 182,
+      "samples": 646,
+      "chrome": 17,
+      "rssFb": 16680,
+      "rssChrome": 2057788
+    },
+    {
+      "t": 226,
+      "iteration": 183,
+      "samples": 650,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2057872
+    },
+    {
+      "t": 228,
+      "iteration": 184,
+      "samples": 653,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2058784
+    },
+    {
+      "t": 229,
+      "iteration": 185,
+      "samples": 657,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2056516
+    },
+    {
+      "t": 230,
+      "iteration": 186,
+      "samples": 660,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2057740
+    },
+    {
+      "t": 231,
+      "iteration": 187,
+      "samples": 664,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2056288
+    },
+    {
+      "t": 233,
+      "iteration": 188,
+      "samples": 667,
+      "chrome": 17,
+      "rssFb": 16684,
+      "rssChrome": 2057376
+    },
+    {
+      "t": 234,
+      "iteration": 189,
+      "samples": 671,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2057536
+    },
+    {
+      "t": 235,
+      "iteration": 190,
+      "samples": 674,
+      "chrome": 17,
+      "rssFb": 16616,
+      "rssChrome": 2058448
+    },
+    {
+      "t": 236,
+      "iteration": 191,
+      "samples": 678,
+      "chrome": 17,
+      "rssFb": 16648,
+      "rssChrome": 2055584
+    },
+    {
+      "t": 238,
+      "iteration": 192,
+      "samples": 681,
+      "chrome": 17,
+      "rssFb": 16648,
+      "rssChrome": 2057272
+    },
+    {
+      "t": 239,
+      "iteration": 193,
+      "samples": 685,
+      "chrome": 17,
+      "rssFb": 16648,
+      "rssChrome": 2057304
+    },
+    {
+      "t": 240,
+      "iteration": 194,
+      "samples": 688,
+      "chrome": 17,
+      "rssFb": 16648,
+      "rssChrome": 2057088
+    },
+    {
+      "t": 241,
+      "iteration": 195,
+      "samples": 692,
+      "chrome": 17,
+      "rssFb": 16656,
+      "rssChrome": 2057372
+    },
+    {
+      "t": 243,
+      "iteration": 196,
+      "samples": 695,
+      "chrome": 17,
+      "rssFb": 16656,
+      "rssChrome": 2058648
+    },
+    {
+      "t": 243,
+      "iteration": 197,
+      "samples": 699,
+      "chrome": 17,
+      "rssFb": 16740,
+      "rssChrome": 2057716
+    },
+    {
+      "t": 245,
+      "iteration": 198,
+      "samples": 702,
+      "chrome": 17,
+      "rssFb": 16740,
+      "rssChrome": 2057372
+    },
+    {
+      "t": 246,
+      "iteration": 199,
+      "samples": 706,
+      "chrome": 17,
+      "rssFb": 16740,
+      "rssChrome": 2058500
+    },
+    {
+      "t": 248,
+      "iteration": 200,
+      "samples": 710,
+      "chrome": 17,
+      "rssFb": 16744,
+      "rssChrome": 2062876
+    },
+    {
+      "t": 249,
+      "iteration": 201,
+      "samples": 714,
+      "chrome": 17,
+      "rssFb": 16728,
+      "rssChrome": 2056820
+    },
+    {
+      "t": 250,
+      "iteration": 202,
+      "samples": 717,
+      "chrome": 17,
+      "rssFb": 16728,
+      "rssChrome": 2058284
+    },
+    {
+      "t": 251,
+      "iteration": 203,
+      "samples": 721,
+      "chrome": 17,
+      "rssFb": 16704,
+      "rssChrome": 2057520
+    },
+    {
+      "t": 253,
+      "iteration": 204,
+      "samples": 724,
+      "chrome": 17,
+      "rssFb": 16704,
+      "rssChrome": 2057904
+    },
+    {
+      "t": 254,
+      "iteration": 205,
+      "samples": 728,
+      "chrome": 17,
+      "rssFb": 16696,
+      "rssChrome": 2057700
+    },
+    {
+      "t": 255,
+      "iteration": 206,
+      "samples": 731,
+      "chrome": 17,
+      "rssFb": 16696,
+      "rssChrome": 2059968
+    },
+    {
+      "t": 256,
+      "iteration": 207,
+      "samples": 735,
+      "chrome": 17,
+      "rssFb": 16720,
+      "rssChrome": 2058264
+    },
+    {
+      "t": 258,
+      "iteration": 208,
+      "samples": 738,
+      "chrome": 17,
+      "rssFb": 16720,
+      "rssChrome": 2057332
+    },
+    {
+      "t": 258,
+      "iteration": 209,
+      "samples": 742,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057312
+    },
+    {
+      "t": 260,
+      "iteration": 210,
+      "samples": 745,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2058076
+    },
+    {
+      "t": 261,
+      "iteration": 211,
+      "samples": 749,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2056748
+    },
+    {
+      "t": 262,
+      "iteration": 212,
+      "samples": 752,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2058168
+    },
+    {
+      "t": 263,
+      "iteration": 213,
+      "samples": 756,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057476
+    },
+    {
+      "t": 265,
+      "iteration": 214,
+      "samples": 759,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057780
+    },
+    {
+      "t": 266,
+      "iteration": 215,
+      "samples": 763,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057756
+    },
+    {
+      "t": 267,
+      "iteration": 216,
+      "samples": 766,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2058332
+    },
+    {
+      "t": 268,
+      "iteration": 217,
+      "samples": 770,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057216
+    },
+    {
+      "t": 270,
+      "iteration": 218,
+      "samples": 773,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2059208
+    },
+    {
+      "t": 271,
+      "iteration": 219,
+      "samples": 777,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2058632
+    },
+    {
+      "t": 273,
+      "iteration": 220,
+      "samples": 781,
+      "chrome": 17,
+      "rssFb": 16776,
+      "rssChrome": 2062352
+    },
+    {
+      "t": 273,
+      "iteration": 221,
+      "samples": 785,
+      "chrome": 17,
+      "rssFb": 16776,
+      "rssChrome": 2057516
+    },
+    {
+      "t": 275,
+      "iteration": 222,
+      "samples": 788,
+      "chrome": 17,
+      "rssFb": 16776,
+      "rssChrome": 2058428
+    },
+    {
+      "t": 276,
+      "iteration": 223,
+      "samples": 792,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057272
+    },
+    {
+      "t": 277,
+      "iteration": 224,
+      "samples": 795,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057240
+    },
+    {
+      "t": 278,
+      "iteration": 225,
+      "samples": 799,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2057996
+    },
+    {
+      "t": 280,
+      "iteration": 226,
+      "samples": 802,
+      "chrome": 17,
+      "rssFb": 16772,
+      "rssChrome": 2059328
+    },
+    {
+      "t": 281,
+      "iteration": 227,
+      "samples": 806,
+      "chrome": 17,
+      "rssFb": 16788,
+      "rssChrome": 2056788
+    },
+    {
+      "t": 282,
+      "iteration": 228,
+      "samples": 809,
+      "chrome": 17,
+      "rssFb": 16788,
+      "rssChrome": 2056804
+    },
+    {
+      "t": 283,
+      "iteration": 229,
+      "samples": 813,
+      "chrome": 17,
+      "rssFb": 16788,
+      "rssChrome": 2058220
+    },
+    {
+      "t": 285,
+      "iteration": 230,
+      "samples": 816,
+      "chrome": 17,
+      "rssFb": 16788,
+      "rssChrome": 2059400
+    },
+    {
+      "t": 286,
+      "iteration": 231,
+      "samples": 820,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2060228
+    },
+    {
+      "t": 287,
+      "iteration": 232,
+      "samples": 823,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2061112
+    },
+    {
+      "t": 288,
+      "iteration": 233,
+      "samples": 827,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2060276
+    },
+    {
+      "t": 290,
+      "iteration": 234,
+      "samples": 830,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2058548
+    },
+    {
+      "t": 290,
+      "iteration": 235,
+      "samples": 834,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2058424
+    },
+    {
+      "t": 292,
+      "iteration": 236,
+      "samples": 837,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2057512
+    },
+    {
+      "t": 293,
+      "iteration": 237,
+      "samples": 841,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2057620
+    },
+    {
+      "t": 295,
+      "iteration": 238,
+      "samples": 844,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2058456
+    },
+    {
+      "t": 295,
+      "iteration": 239,
+      "samples": 848,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2058384
+    },
+    {
+      "t": 297,
+      "iteration": 240,
+      "samples": 852,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2062484
+    },
+    {
+      "t": 298,
+      "iteration": 241,
+      "samples": 856,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2058716
+    },
+    {
+      "t": 300,
+      "iteration": 242,
+      "samples": 859,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2059588
+    },
+    {
+      "t": 301,
+      "iteration": 243,
+      "samples": 863,
+      "chrome": 17,
+      "rssFb": 16816,
+      "rssChrome": 2057344
+    }
+  ]
+}

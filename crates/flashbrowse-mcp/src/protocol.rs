@@ -3,19 +3,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const LATEST_VERSION: &str = "2025-06-18";
+
 /// Supported protocol versions (highest first).
-pub const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+pub const SUPPORTED_VERSIONS: &[&str] = &[LATEST_VERSION, "2025-03-26", "2024-11-05"];
 
 /// Negotiate the highest mutually supported version.
 pub fn negotiate(client_version: Option<&str>) -> String {
     match client_version {
-        None => SUPPORTED_VERSIONS[0].to_string(),
+        None => LATEST_VERSION.to_string(),
         Some(v) => {
             if SUPPORTED_VERSIONS.contains(&v) {
                 v.to_string()
             } else {
                 // Unknown/newer client version: offer latest we speak.
-                SUPPORTED_VERSIONS[0].to_string()
+                LATEST_VERSION.to_string()
             }
         }
     }

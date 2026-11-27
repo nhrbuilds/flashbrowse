@@ -27,7 +27,14 @@ impl AXValue {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Number(n)) => n.to_string(),
             Some(Value::Bool(b)) => b.to_string(),
-            Some(other) => other.to_string(),
+            Some(other) => {
+                if let Err(error) = crate::transport::validate_json_depth(other) {
+                    tracing::warn!(%error, "accessibility value is too deeply nested");
+                    return "[invalid accessibility value: JSON nesting exceeds the limit]"
+                        .to_string();
+                }
+                other.to_string()
+            }
         }
     }
 
@@ -177,4 +184,20 @@ pub async fn get_full_ax_tree_for_frame(
             },
         )
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn deeply_nested_accessibility_value_does_not_overflow() {
+        let deep = (0..10_000).fold(serde_json::Value::Null, |value, _| {
+            serde_json::Value::Array(vec![value])
+        });
+        let mut value = super::AXValue {
+            type_: None,
+            value: Some(deep),
+        };
+        assert!(value.as_text().contains("JSON nesting exceeds"));
+        super::super::super::transport::drop_json_iteratively(value.value.take().unwrap());
+    }
 }

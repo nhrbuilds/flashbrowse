@@ -34,6 +34,10 @@ pub async fn get_version(client: &CdpClient) -> Result<GetVersionResponse, CdpEr
 /// Resolve a Chrome debugging endpoint (`http(s)://host[:port]`) or accept a
 /// direct `ws(s)://` browser WebSocket URL.
 pub async fn resolve_websocket_url(endpoint: &str) -> Result<String, CdpError> {
+    crate::runtime::run(resolve_websocket_url_inner(endpoint)).await?
+}
+
+async fn resolve_websocket_url_inner(endpoint: &str) -> Result<String, CdpError> {
     if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
         return Ok(endpoint.to_string());
     }
@@ -45,7 +49,17 @@ pub async fn resolve_websocket_url(endpoint: &str) -> Result<String, CdpError> {
         });
     }
     let url = format!("{trimmed}/json/version");
-    let response = reqwest::get(&url)
+    let client =
+        reqwest::Client::builder()
+            .build()
+            .map_err(|error| CdpError::InvalidCdpEndpoint {
+                endpoint: endpoint.to_string(),
+                detail: error.to_string(),
+            })?;
+    crate::transport::require_runtime()?;
+    let response = client
+        .get(&url)
+        .send()
         .await
         .map_err(|error| CdpError::InvalidCdpEndpoint {
             endpoint: endpoint.to_string(),
@@ -90,6 +104,56 @@ pub async fn set_download_behavior(
                 "downloadPath": download_path,
                 "eventsEnabled": true,
             }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Grant browser permissions (e.g. `geolocation`, `notifications`, `clipboardReadWrite`).
+pub async fn grant_permissions(
+    client: &CdpClient,
+    origin: Option<&str>,
+    permissions: &[String],
+    browser_context_id: Option<&str>,
+) -> Result<(), CdpError> {
+    let mut params =
+        serde_json::Map::from_iter([("permissions".into(), serde_json::to_value(permissions)?)]);
+    if let Some(o) = origin {
+        params.insert("origin".into(), serde_json::Value::String(o.to_string()));
+    }
+    if let Some(cid) = browser_context_id {
+        params.insert(
+            "browserContextId".into(),
+            serde_json::Value::String(cid.to_string()),
+        );
+    }
+    let _: serde_json::Value = client
+        .send(
+            None,
+            "Browser.grantPermissions",
+            serde_json::Value::Object(params),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Reset granted permissions for the default or isolated browser context.
+pub async fn reset_permissions(
+    client: &CdpClient,
+    browser_context_id: Option<&str>,
+) -> Result<(), CdpError> {
+    let mut params = serde_json::Map::new();
+    if let Some(cid) = browser_context_id {
+        params.insert(
+            "browserContextId".into(),
+            serde_json::Value::String(cid.to_string()),
+        );
+    }
+    let _: serde_json::Value = client
+        .send(
+            None,
+            "Browser.resetPermissions",
+            serde_json::Value::Object(params),
         )
         .await?;
     Ok(())

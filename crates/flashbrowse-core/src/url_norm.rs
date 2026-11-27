@@ -139,7 +139,7 @@ pub fn normalize_url(input: &str) -> Result<String, UrlError> {
     let candidate = format!(
         "{scheme}://{}{}",
         bracket_ipv6_authority(authority),
-        &t[authority.len()..]
+        t.strip_prefix(authority).unwrap_or_default()
     );
 
     let parsed = Url::parse(&candidate).map_err(|_| UrlError::NotAUrl {
@@ -157,8 +157,7 @@ pub fn normalize_url(input: &str) -> Result<String, UrlError> {
 
 /// Split `scheme:rest` when `scheme` is syntactically a URI scheme.
 fn split_scheme(input: &str) -> Option<(&str, &str)> {
-    let colon = input.find(':')?;
-    let token = &input[..colon];
+    let (token, rest) = input.split_once(':')?;
     let mut chars = token.chars();
     let first = chars.next()?;
     if !first.is_ascii_alphabetic() {
@@ -167,13 +166,12 @@ fn split_scheme(input: &str) -> Option<(&str, &str)> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
         return None;
     }
-    Some((token, &input[colon + 1..]))
+    Some((token, rest))
 }
 
 /// Authority portion: everything before the path, query or fragment.
 fn host_of(input: &str) -> &str {
-    let end = input.find(['/', '?', '#']).unwrap_or(input.len());
-    &input[..end]
+    input.split(['/', '?', '#']).next().unwrap_or_default()
 }
 
 /// Drop the port, keeping IPv6 brackets out of the way.
@@ -189,10 +187,9 @@ fn host_without_port(hostport: &str) -> &str {
 /// can put two colons inside a host.
 fn split_host_port(hostport: &str) -> (&str, Option<&str>) {
     if let Some(rest) = hostport.strip_prefix('[') {
-        return match rest.find(']') {
-            Some(i) => {
-                let host = &rest[..i];
-                let port = rest[i + 1..].strip_prefix(':').filter(|p| !p.is_empty());
+        return match rest.split_once(']') {
+            Some((host, tail)) => {
+                let port = tail.strip_prefix(':').filter(|p| !p.is_empty());
                 (host, port)
             }
             None => (rest, None),
@@ -201,8 +198,8 @@ fn split_host_port(hostport: &str) -> (&str, Option<&str>) {
     if hostport.matches(':').count() > 1 {
         return (hostport, None);
     }
-    match hostport.find(':') {
-        Some(i) => (&hostport[..i], Some(&hostport[i + 1..])),
+    match hostport.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
         None => (hostport, None),
     }
 }

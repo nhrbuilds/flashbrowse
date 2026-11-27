@@ -46,6 +46,17 @@ pub async fn run(
 
         let tree = match action.as_str() {
             "click" => session.click(action_id).await?,
+            "double_click" => session.double_click(action_id).await?,
+            "right_click" => session.right_click(action_id).await?,
+            "drag_and_drop" => {
+                let target_id = value
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("drag_and_drop requires --value <target_action_id>")
+                    })?
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("target_action_id must be an integer"))?;
+                session.drag_and_drop(action_id, target_id).await?
+            }
             "fill" => {
                 let v = value.ok_or_else(|| anyhow::anyhow!("fill requires --value <text>"))?;
                 session.fill(action_id, &v).await?
@@ -58,21 +69,24 @@ pub async fn run(
             "scroll" => {
                 let dir = ScrollDirection::parse(value.as_deref().unwrap_or("down"))
                     .unwrap_or(ScrollDirection::Down);
-                session.scroll(dir, 300.0).await?
+                session
+                    .scroll_at((action_id > 0).then_some(action_id), dir, 300.0)
+                    .await?
             }
             "select" => {
                 let v = value.ok_or_else(|| anyhow::anyhow!("select requires --value <option>"))?;
                 session.select(action_id, &v).await?
             }
             "upload" => {
-                let path = value.ok_or_else(|| anyhow::anyhow!("upload requires --value <file-path>"))?;
+                let path =
+                    value.ok_or_else(|| anyhow::anyhow!("upload requires --value <file-path>"))?;
                 session
                     .upload_files(action_id, &[std::path::PathBuf::from(path)])
                     .await?
             }
             other => {
                 anyhow::bail!(
-                    "unknown action '{other}' (expected click|fill|hover|press_key|scroll|select|upload)"
+                    "unknown action '{other}' (expected click|double_click|right_click|drag_and_drop|fill|hover|press_key|scroll|select|upload)"
                 );
             }
         };
@@ -83,7 +97,7 @@ pub async fn run(
 
     match result {
         Ok(tree) => {
-            println!("{tree}");
+            crate::write_stdout(format_args!("{tree}"))?;
             let payload = (tree.len(), observability::count_actions(&tree));
             observability::record_op("act", &target, started, Some(payload), true, None);
             Ok(())

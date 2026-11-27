@@ -4,6 +4,114 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-27
+
+### Added
+- Navigation controls & explicit waits: `browser_navigate` (`back`, `forward`,
+  `reload`) and `browser_wait_for` (`text`, `selector`, `url`,
+  `network_idle_ms`, traversing open `shadowRoot`s for text and selector
+  matches).
+- Richer input primitives in `browser_act` and CLI `act`: `double_click`,
+  `right_click`, `drag_and_drop` (`target_action_id`), modifier key chords
+  (`Control+K`, `Meta+Enter`, `Shift+Tab`), and element-targeted `scroll` via
+  `action_id`.
+- Framework clickables detection: discovers `addEventListener('click', ...)`
+  on `cursor: pointer` elements verified via `DOMDebugger.getEventListeners`
+  and React 17+ `__reactProps$.onClick` handlers on visible non-ARIA elements.
+- Console & network observability plus lazy request interception:
+  `browser_console` (`list`/`clear`, level filter, uncaught exceptions),
+  `browser_network` (`list`/`body`/`clear`/`set_headers`, bounded 200-entry
+  ring buffer, 64 KiB body cap, `extra_headers` preserved across tab switches),
+  and `browser_route` (lazy `Fetch.enable` mocking and request aborting with
+  wildcard glob patterns).
+- Isolated multi-context sessions: `browser_contexts` (`list`, `create`,
+  `select`, `close`) backed by `Target.createBrowserContext` and
+  `Target.disposeBrowserContext` sharing one Chromium process across isolated
+  cookie/storage contexts.
+- Device emulation, permissions, clipped screenshots, and PDF export:
+  `browser_emulate` (viewport/mobile/DPR, timezone, locale, geolocation,
+  permissions, reset), `browser_screenshot` `action_id` bounding-box clipping,
+  and `browser_pdf` confined under `--file-root/pdfs/<name>.pdf`.
+- `breaking_v1_5` torture suite, release-profile `mcp_malformed_smoke`
+  subprocess test, and a `--suite v15` soak mode that calls all 18 tools. The
+  saved 10-minute development report covers all 18 tools.
+- Five-minute all-tool smoke on the initial v1.5.0 build: 923 calls, zero
+  errors, p50 32 ms, p95 1,345 ms, 0.97x latency drift, 148 kB flashbrowse
+  RSS growth, and zero Chrome processes at exit.
+
+### Changed
+- Replaced the direct `regex` dependency in `flashbrowse-cdp` with a DevTools
+  endpoint parser and enabled only the Tokio features the workspace uses.
+- Configured release builds with `opt-level = "z"`, LTO, one codegen unit, and
+  symbol stripping. Disabled the unused ZIP Zopfli encoder and tar
+  extended-attribute support while retaining ZIP DEFLATE reading and archive
+  handling for self-update. Release builds retain `panic = "unwind"`; production
+  compilation rejects `panic = "abort"`.
+
+### Fixed
+- MCP reports tool panics, including those caught inside browser operations,
+  and enforces the 120 s tool deadline. After a failed task stops, connected
+  browser contexts preserve their cookies and storage. Page operations clear
+  the active tree so action IDs must be refreshed with `browser_wait_for` or
+  `browser_open`. Recoverable context create/close failures preserve sibling
+  contexts and schedule cleanup for contexts left half-created or half-closed.
+  A disconnected browser or tool that does not stop after cancellation resets
+  the session manager. A request-frame panic before output returns an MCP error
+  and leaves the server available. An input failure returns a transport error
+  when stdout remains usable, then closes that connection. A partial response
+  cannot be retried safely; a write failure after output starts, including a
+  writer panic whose written byte count is unknown, closes that connection.
+  Cleanup runs separately. A later `browser_open` can restore
+  access to a disconnected Chrome session.
+- Contained unexpected CLI panics at runtime setup, command execution, and
+  runtime shutdown boundaries, reporting failure through stderr and the exit
+  status. MCP catches panics while polling async operations, dropping their
+  futures, and polling or dropping MCP I/O objects. Screenshot cleanup
+  disconnects the CDP client if a panic interrupts temporary resource-policy
+  changes. Shutdown logs now report when the top-level MCP task stopped after
+  a panic instead of claiming the server recovered and continued.
+- Tab listing stays scoped to the stored browser context after its active tab
+  closes. `browser_open` reattaches to another page in that context, or creates
+  a blank page there if needed. Isolated contexts are disposed when their CDP
+  connection detaches.
+- Chrome pipe startup falls back to WebSocket when the CDP handshake fails.
+  Windows Chrome launches clear inheritance on the parent's standard handles.
+- Scoped CDP background event listeners (`Page.javascriptDialogOpening`,
+  `NetActivity`, `ConsoleTracker`, `NetworkLogTracker`, `RouteInterceptor`, and
+  `Accessibility.loadComplete` in `open`) to `session_id` via `EventEnvelope`,
+  filtered non-popup (`opener_id: None`) targets out of `PopupTracker`, and
+  wired `watch` cancellation on session drop/shutdown so closed contexts or
+  switched tabs never leak tasks or broadcast buffers.
+- Other background event listeners continue after
+  `broadcast::error::RecvError::Lagged`, and event channel capacity is 256.
+  The Fetch route listener disables interception for its target after a queue
+  overflow, releasing unresolved requests whose pause event was lost. All V8
+  remote handles in `collect_clickable_non_aria_backends` are released with
+  `Runtime.releaseObjectGroup`.
+- `browser_open` now returns an error and invalidates stale action IDs when
+  the page does not produce a stable, non-empty accessibility tree within the
+  15-second settle deadline. It does not return the latest partial snapshot.
+- Preserved active `browser_route` rules across `select_tab` (propagating
+  restore errors instead of ignoring them), validated route HTTP status codes
+  (`100..=599`) and `content_type` headers, attempting `Fetch.continueRequest`
+  when fulfill or abort fails, fixed `drag_and_drop`
+  scrolled-target coordinate ordering and `buttons: 1` state, cleared `timezone`
+  and `locale` in `reset_emulation`, restored `Network.setBlockedURLs` resource
+  policy on clipped screenshot errors, validated emulation/PDF/route/scroll
+  input bounds, rejected Windows reserved device stems (`CON`, `NUL`, `COM1..9`,
+  `LPT1..9`) in `browser_pdf` and `browser_storage_state` plus PDF symlink
+  confinement, and fixed multi-wildcard backtracking in `url_matches`.
+- Hardened Windows `TcpListener` test servers across `flashbrowse-core` and
+  `flashbrowse-mcp` integration tests to drain full HTTP headers per connection
+  thread and perform `Shutdown::Write` so Winsock does not emit TCP `RST`.
+- Scoped Unix-only test imports so Windows CI can run with warnings denied.
+- Fixed persistent session cleanup on macOS by stopping the Chromium process
+  group on Unix and retrying temporary profile removal if the directory is
+  still being modified during shutdown.
+- CDP pipe and WebSocket writers now cancel in-flight writes when the reader
+  fails. Pending calls return a disconnected error instead of leaving a writer
+  task blocked in I/O.
+
 ## [1.4.0] - 2026-11-25
 
 ### Added
@@ -22,7 +130,7 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 - `browser_fill_form` MCP tool for updating multiple form fields from one
   starting tree and returning one authoritative refreshed tree (with completed
   IDs reported on partial failure).
-- POSIX pipe CDP transport (`--remote-debugging-pipe`) for Flashbrowse-launched
+- POSIX pipe CDP transport (`--remote-debugging-pipe`) for flashbrowse-launched
   Chrome on Unix with WebSocket fallback (WebSocket retained for Windows and
   persistent `--session-id` sessions).
 - Open `shadowRoot` coverage in settle mutation tracking and

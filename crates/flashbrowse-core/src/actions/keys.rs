@@ -140,9 +140,62 @@ pub fn resolve(key: &str) -> Option<KeySpec> {
     Some(spec)
 }
 
+/// A resolved key chord (optional modifiers + primary key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChord {
+    /// CDP modifier bitmask: Alt=1, Control=2, Meta=4, Shift=8.
+    pub modifiers: i64,
+    /// Modifier key specs to press before and release after the primary key.
+    pub modifier_specs: Vec<KeySpec>,
+    /// Primary key spec.
+    pub key: KeySpec,
+}
+
+/// Resolve a single key or `+`-delimited key chord (e.g. `"Control+K"`, `"Shift+Tab"`, `"Meta+Enter"`).
+pub fn resolve_chord(input: &str) -> Option<KeyChord> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains('+') {
+        let key = resolve(trimmed)?;
+        return Some(KeyChord {
+            modifiers: 0,
+            modifier_specs: Vec::new(),
+            key,
+        });
+    }
+    let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
+    if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let (&primary_raw, chord_modifiers) = parts.split_last()?;
+    let mut modifiers = 0i64;
+    let mut modifier_specs = Vec::with_capacity(chord_modifiers.len());
+    for &part in chord_modifiers {
+        let (bit, canonical) = match part.to_ascii_lowercase().as_str() {
+            "alt" | "option" => (1, "Alt"),
+            "control" | "ctrl" => (2, "Control"),
+            "meta" | "command" | "cmd" => (4, "Meta"),
+            "shift" => (8, "Shift"),
+            _ => return None,
+        };
+        if modifiers & bit == 0 {
+            modifiers |= bit;
+            modifier_specs.push(resolve(canonical)?);
+        }
+    }
+    let key = resolve(primary_raw)?;
+    Some(KeyChord {
+        modifiers,
+        modifier_specs,
+        key,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve;
+    use super::{resolve, resolve_chord};
 
     #[test]
     fn named_keys() {
@@ -175,5 +228,29 @@ mod tests {
         assert!(resolve("").is_none());
         assert!(resolve("   ").is_none());
         assert!(resolve("Ctrl+C").is_none());
+    }
+
+    #[test]
+    fn parses_modifier_chords() {
+        let c = resolve_chord("Control+k").unwrap();
+        assert_eq!(c.modifiers, 2);
+        assert_eq!(c.modifier_specs.len(), 1);
+        assert_eq!(c.key.code, "KeyK");
+
+        let combo = resolve_chord("Control+Shift+Z").unwrap();
+        assert_eq!(combo.modifiers, 2 | 8);
+        assert_eq!(combo.modifier_specs.len(), 2);
+        assert_eq!(combo.key.code, "KeyZ");
+
+        let tab = resolve_chord("Shift+Tab").unwrap();
+        assert_eq!(tab.modifiers, 8);
+        assert_eq!(tab.key.code, "Tab");
+
+        let single = resolve_chord("Enter").unwrap();
+        assert_eq!(single.modifiers, 0);
+        assert!(single.modifier_specs.is_empty());
+
+        assert!(resolve_chord("Bogus+K").is_none());
+        assert!(resolve_chord("Control+").is_none());
     }
 }

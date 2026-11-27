@@ -9,16 +9,27 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.40", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "io-std",
+    "net",
+    "process",
+    "sync",
+    "time",
+    "fs",
+    "signal",
+] }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
+rustix = { version = "1.1", features = ["process"] }
 futures-util = "0.3"
-libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-# Only `deflate` is enabled: Chrome-for-Testing archives are deflate/store
-# only, and the AES/LZMA/Zstd decoders are attack surface we never exercise.
-zip = { version = "9.0", default-features = false, features = ["deflate"] }
+# Only the flate2 DEFLATE decoder is enabled. flashbrowse reads ZIP archives
+# and never compresses them, so the Zopfli encoder is unnecessary.
+zip = { version = "9.0", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1.1"
-tar = "0.4"
+tar = { version = "0.4", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -28,12 +39,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 clap = { version = "4.5", features = ["derive", "env"] }
 which = "7.0"
 dashmap = "6.1"
-regex = "1.11"
 async-trait = "0.1"
 url = "2.5"
 
 [workspace.package]
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/nhrbuilds/flashbrowse"
@@ -42,6 +52,8 @@ repository = "https://github.com/nhrbuilds/flashbrowse"
 all = { level = "warn", priority = -1 }
 
 [profile.release]
+panic = "unwind"
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true

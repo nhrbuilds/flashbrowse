@@ -1,5 +1,7 @@
 # flashbrowse - agent conventions
 
+- **Commits:** Ask the maintainer which branch to commit on and wait for their answer before every commit, including documentation changes and amendments.
+- **Project name:** Always write `flashbrowse` in lowercase, including at the start of a sentence and in commit messages, tag annotations, and release notes. Preserve the exact spelling of existing identifiers such as `FLASHBROWSE_*` environment variables.
 - **Decision lock:** session-file hybrid, `--chrome-path`/`CHROME_PATH` support, `ResourcePolicy` (`agent-default` | `text-only` | `full-render`, legacy `--text-only`), scheme-less URL resolution (`url_norm`, https assumed, local hosts get http), MCP latest (2025-06-18).
 - **Screenshots:** same MCP session (`browser_screenshot`); blocking lift must not change AX tree output. Screenshot prepare uses network idle + image readiness (timeout capped), not a fixed 400 ms sleep. Lifting the blocklist is not enough on its own: Chrome never retries a blocked request, so blocked images must be re-requested for the capture.
 - **Firefox:** `flashbrowse-bidi` crate = discovery/launch groundwork only; production sessions remain Chrome until BiDi AX tree lands.

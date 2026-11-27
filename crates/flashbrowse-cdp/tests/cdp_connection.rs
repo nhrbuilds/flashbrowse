@@ -13,9 +13,14 @@ async fn test_cdp_connection_and_get_version() {
         eprintln!("SKIP: no Chromium binary found");
         return;
     }
-    let mut chrome = flashbrowse_cdp::launch_chrome(LaunchOptions::default())
-        .await
-        .expect("launch chrome");
+    let mut chrome = flashbrowse_cdp::launch_chrome(LaunchOptions {
+        // This test verifies the WebSocket path. Explicitly select it because
+        // ephemeral launches otherwise prefer the POSIX pipe transport.
+        extra_args: vec!["--remote-debugging-port=0".to_string()],
+        ..Default::default()
+    })
+    .await
+    .expect("launch chrome");
 
     let client = CdpClient::connect_chrome(&mut chrome)
         .await

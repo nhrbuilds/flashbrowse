@@ -18,6 +18,7 @@
  *   --url <u>         a URL to include; repeatable
  *   --interval <ms>   pause between iterations (default 250)
  *   --screenshot      include a screenshot tool call every N iterations
+ *   --suite <mode>    default | v15 (v15 spins up a local HTTP page and exercises all 18 MCP tools)
  *   --out <file>      write the JSON report here (default: soak-report.json)
  *   --bin <path>      flashbrowse binary (default: target/release/flashbrowse)
  *   --check-report <file>
@@ -34,8 +35,10 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 
 // ---------------------------------------------------------------- arguments
@@ -46,6 +49,7 @@ function parseArgs(argv) {
     urls: [],
     interval: 250,
     screenshotEvery: 20,
+    suite: "default",
     out: "soak-report.json",
     bin: "target/release/flashbrowse",
     checkReport: null,
@@ -64,6 +68,9 @@ function parseArgs(argv) {
         break;
       case "--screenshot":
         args.screenshotEvery = Number(argv[++i]);
+        break;
+      case "--suite":
+        args.suite = argv[++i];
         break;
       case "--out":
         args.out = argv[++i];
@@ -394,9 +401,60 @@ function evaluateGates({ timeline, durationSec, errorCount, toolCalls, driftRati
   };
 }
 
+// ---------------------------------------------------------------- local v1.5 test fixture
+
+async function startV15FixtureServer() {
+  const pageHtml = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Soak15</title></head><body>
+<h1>Soak V15</h1>
+<input id="f1" aria-label="FullName" />
+<input id="up" type="file" aria-label="UploadInput" />
+<button id="dbl" ondblclick="this.textContent='DblDone'">DblBtn</button>
+<button id="ctx" oncontextmenu="event.preventDefault();this.textContent='CtxDone'">CtxBtn</button>
+<button id="drag">DragSrc</button>
+<button id="drop" onmouseup="this.textContent='DropDone'">DropDst</button>
+<div id="ael" style="cursor:pointer">AelItem</div>
+<div id="scroller" tabindex="0" style="width:160px;height:50px;overflow:auto"><div style="height:300px">Inner</div></div>
+<div id="shadow-host"></div>
+<script>
+console.log('soak-tick');
+document.getElementById('ael').addEventListener('click', () => { document.title = 'AelClicked'; });
+setTimeout(() => {
+  const r = document.getElementById('shadow-host').attachShadow({mode: 'open'});
+  r.innerHTML = '<p class="ready-shadow">ShadowUp</p>';
+}, 50);
+</script></body></html>`;
+  const twoHtml = `<!doctype html><html><head><title>SoakTwo</title></head><body><h1>Page Two</h1></body></html>`;
+  const server = createServer((req, res) => {
+    if (req.url === "/two") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(twoHtml);
+    } else if (req.url === "/api/echo") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ live: true }));
+    } else {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(pageHtml);
+    }
+  });
+  await new Promise((res) => server.listen(0, "127.0.0.1", res));
+  const { port } = server.address();
+  return { server, baseUrl: `http://127.0.0.1:${port}` };
+}
+
 // ---------------------------------------------------------------- soak run
 
-const child = spawn(BIN, ["mcp", "--log-format", "json"], {
+const fileRoot = args.suite === "v15" ? mkdtempSync(join(tmpdir(), "flashbrowse-soak-")) : null;
+const storageRoot =
+  args.suite === "v15" ? mkdtempSync(join(tmpdir(), "flashbrowse-soak-state-")) : null;
+if (fileRoot) {
+  writeFileSync(join(fileRoot, "upload.txt"), "soak-upload-payload\n");
+}
+const v15Server = args.suite === "v15" ? await startV15FixtureServer() : null;
+const mcpArgs = ["mcp", "--log-format", "json"];
+if (fileRoot) mcpArgs.push("--file-root", fileRoot);
+if (storageRoot) mcpArgs.push("--storage-state-root", storageRoot);
+
+const child = spawn(BIN, mcpArgs, {
   stdio: ["pipe", "pipe", "pipe"],
 });
 const client = new McpClient(child);
@@ -495,33 +553,135 @@ let currentUrlIndex = 0;
 
 while (Date.now() < deadline) {
   iteration++;
-  const url = args.urls[currentUrlIndex % args.urls.length];
-  currentUrlIndex++;
+  if (args.suite === "v15" && v15Server) {
+    const base = v15Server.baseUrl;
+    const open = await timed("browser_open", { url: `${base}/` });
+    progress();
 
-  const open = await timed("browser_open", { url });
-  progress();
+    let currentTree = open.text ?? "";
+    const idFor = (label, fallback) => {
+      const line = currentTree.split("\n").find((l) => l.includes(label));
+      const m = line?.match(/^\s*\[(\d+)\]/);
+      return m ? Number(m[1]) : fallback;
+    };
 
-  const tree = open.text ?? "";
-  const ids = actionIds(tree);
-
-  // Exercise a rotating subset of tools against whatever the page offers.
-  await timed("browser_act", {
-    action_id: ids.length ? ids[0] : 1,
-    action: "scroll",
-    value: "down",
-  });
-
-  if (ids.length > 1) {
-    await timed("browser_act", {
-      action_id: ids[1],
-      action: "hover",
+    await timed("browser_wait_for", { selector: ".ready-shadow", timeout_ms: 3000 });
+    const filled = await timed("browser_fill_form", {
+      fields: [{ action_id: idFor("FullName", 1), value: "Ada" }],
     });
-  }
+    if (filled.ok && filled.text) currentTree = filled.text;
+    const uploaded = await timed("browser_upload", {
+      action_id: idFor("UploadInput", 2),
+      files: ["upload.txt"],
+    });
+    if (uploaded.ok && uploaded.text) currentTree = uploaded.text;
+    const dbl = await timed("browser_act", {
+      action_id: idFor("DblBtn", 3),
+      action: "double_click",
+    });
+    if (dbl.ok && dbl.text) currentTree = dbl.text;
+    const ctxClick = await timed("browser_act", {
+      action_id: idFor("CtxBtn", 4),
+      action: "right_click",
+    });
+    if (ctxClick.ok && ctxClick.text) currentTree = ctxClick.text;
+    const drag = await timed("browser_act", {
+      action_id: idFor("DragSrc", 5),
+      target_action_id: idFor("DropDst", 6),
+      action: "drag_and_drop",
+    });
+    if (drag.ok && drag.text) currentTree = drag.text;
+    const ael = await timed("browser_act", {
+      action_id: idFor("AelItem", 7),
+      action: "click",
+    });
+    if (ael.ok && ael.text) currentTree = ael.text;
+    const keyAct = await timed("browser_act", { action: "press_key", value: "Control+k" });
+    if (keyAct.ok && keyAct.text) currentTree = keyAct.text;
+    const ids = actionIds(currentTree);
+    const scrl = await timed("browser_act", {
+      action_id: ids[0] ?? 1,
+      action: "scroll",
+      value: "down",
+      amount: 120,
+    });
+    if (scrl.ok && scrl.text) currentTree = scrl.text;
 
-  await timed("browser_extract_markdown", {});
+    await timed("browser_tabs", { action: "list" });
+    await timed("browser_downloads", { action: "list" });
 
-  if (iteration % args.screenshotEvery === 0) {
-    await timed("browser_screenshot", { full_page: false });
+    await timed("browser_open", { url: `${base}/two` });
+    await timed("browser_navigate", { action: "back" });
+    await timed("browser_navigate", { action: "forward" });
+    await timed("browser_navigate", { action: "back" });
+    const reloaded = await timed("browser_navigate", {
+      action: "reload",
+      ignore_cache: false,
+    });
+    if (reloaded.ok && reloaded.text) currentTree = reloaded.text;
+
+    await timed("browser_route", {
+      action: "add",
+      url_pattern: "*/api/echo",
+      body: '{"mocked":true}',
+    });
+    await timed("browser_evaluate", {
+      expression: "(() => { const x = new XMLHttpRequest(); x.open('GET', '/api/echo', false); x.send(); return x.responseText; })()",
+    });
+    await timed("browser_route", { action: "clear" });
+    await timed("browser_console", { action: "list" });
+    await timed("browser_console", { action: "clear" });
+    await timed("browser_network", { action: "list" });
+    await timed("browser_network", { action: "clear" });
+
+    if (iteration === 1 || iteration % 5 === 0) {
+      await timed("browser_storage_state", { action: "export", name: "soak-state" });
+      const imp = await timed("browser_storage_state", { action: "import", name: "soak-state" });
+      if (imp.ok && imp.text) currentTree = imp.text;
+      const ctx = `soak-ctx-${iteration}`;
+      await timed("browser_contexts", { action: "create", name: ctx });
+      await timed("browser_open", { url: `${base}/` });
+      await timed("browser_contexts", { action: "close", name: ctx });
+    }
+    if (iteration === 1 || iteration % args.screenshotEvery === 0) {
+      await timed("browser_emulate", {
+        viewport: { width: 390, height: 844, device_scale_factor: 2, mobile: true },
+        timezone: "UTC",
+      });
+      await timed("browser_screenshot", { action_id: idFor("DblBtn", 3) });
+      await timed("browser_pdf", { name: "soak-sample" });
+      await timed("browser_emulate", { reset: true });
+    }
+    await timed("browser_extract_markdown", {});
+  } else {
+    const url = args.urls[currentUrlIndex % args.urls.length];
+    currentUrlIndex++;
+
+    const open = await timed("browser_open", { url });
+    progress();
+
+    const tree = open.text ?? "";
+    const ids = actionIds(tree);
+
+    // Exercise a rotating subset of tools against whatever the page offers.
+    await timed("browser_act", {
+      action_id: ids.length ? ids[0] : 1,
+      action: "scroll",
+      value: "down",
+    });
+
+    if (ids.length > 1) {
+      await timed("browser_act", {
+        action_id: ids[1],
+        action: "hover",
+      });
+    }
+
+    await timed("browser_extract_markdown", {});
+
+    if (iteration % args.screenshotEvery === 0) {
+      await timed("browser_screenshot", { full_page: false });
+    }
   }
 
   progress();
@@ -551,6 +711,17 @@ await new Promise((r) => {
     r();
   }, 5000);
 });
+if (v15Server) v15Server.server.close();
+if (fileRoot) {
+  try {
+    rmSync(fileRoot, { recursive: true, force: true });
+  } catch {}
+}
+if (storageRoot) {
+  try {
+    rmSync(storageRoot, { recursive: true, force: true });
+  } catch {}
+}
 
 // ---------------------------------------------------------------- report
 
