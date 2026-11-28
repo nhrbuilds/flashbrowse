@@ -111,5 +111,23 @@ fn closing_persistent_session_preserves_caller_profile_in_temp() {
         String::from_utf8_lossy(&close.stderr)
     );
     assert_eq!(std::fs::read(&marker).unwrap(), b"preserve");
-    std::fs::remove_dir_all(root).unwrap();
+    remove_dir_all_retrying(&root);
+}
+
+/// `close` returns as soon as the browser tree is signalled, but Chromium
+/// children can still be releasing profile files for a moment afterwards.
+/// Windows reports a sharing violation (code 32) while that happens, so retry
+/// briefly. Cleanup of the test's temp dir must never fail the assertion.
+fn remove_dir_all_retrying(path: &std::path::Path) {
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) if started.elapsed() < std::time::Duration::from_secs(5) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return,
+        }
+    }
 }
