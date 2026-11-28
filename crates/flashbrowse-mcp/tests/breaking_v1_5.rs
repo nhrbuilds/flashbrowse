@@ -226,33 +226,56 @@ setTimeout(() => { throw new Error('uncaught-ring-tail'); }, 15);
     assert!(err_arr.iter().all(|e| e["level"] == "error"));
     assert!(err_arr.iter().any(|e| e["text"] == "tail-error"));
 
-    let net_all = roundtrip(
-        &mut out,
-        &mut lines,
-        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"list"}}}),
-    )
+    // Network idle and the network log observe different signals. Wait for the
+    // actual MCP result, while retaining a strict assertion and useful diagnostics.
+    let mut net_arr: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    let arrived = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let net_fail = roundtrip(
+                &mut out,
+                &mut lines,
+                serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"list","failed_only":true}}}),
+            )
+            .await;
+            assert_tool_ok(&net_fail);
+            failed = serde_json::from_str(&tool_text(&net_fail)).expect("fail JSON");
+            let net_all = roundtrip(
+                &mut out,
+                &mut lines,
+                serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"list"}}}),
+            )
+            .await;
+            assert_tool_ok(&net_all);
+            net_arr = serde_json::from_str(&tool_text(&net_all)).expect("network JSON");
+
+            if failed.iter().any(|entry| {
+                entry["url"].as_str().is_some_and(|url| url.ends_with("/api/fail"))
+                    && entry["status"] == 500
+                    && entry["failed"] == true
+            }) {
+                assert!(failed.iter().all(|entry| entry["failed"] == true));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
     .await;
-    assert_tool_ok(&net_all);
-    let net_arr: Vec<Value> = serde_json::from_str(&tool_text(&net_all)).expect("network JSON");
+    if arrived.is_err() {
+        let tail: Vec<_> = net_arr
+            .iter()
+            .filter(|entry| {
+                entry["url"]
+                    .as_str()
+                    .is_some_and(|url| url.ends_with("/api/fail") || url.ends_with("/api/big"))
+            })
+            .collect();
+        panic!("failed_only missing /api/fail 500 entry; network log: {tail:?}; failed_only: {failed:?}");
+    }
     assert_eq!(
         net_arr.len(),
         200,
         "network ring buffer must stay capped at 200"
-    );
-
-    let net_fail = roundtrip(
-        &mut out,
-        &mut lines,
-        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_network","arguments":{"action":"list","failed_only":true}}}),
-    )
-    .await;
-    assert_tool_ok(&net_fail);
-    let fail_arr: Vec<Value> = serde_json::from_str(&tool_text(&net_fail)).expect("fail JSON");
-    assert!(
-        fail_arr.iter().any(
-            |e| e["url"].as_str().is_some_and(|u| u.contains("/api/fail")) && e["status"] == 500
-        ),
-        "failed_only missing /api/fail 500 entry: {fail_arr:?}"
     );
 
     let big_req_id = net_arr

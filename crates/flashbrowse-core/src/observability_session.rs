@@ -15,6 +15,7 @@ mod network;
 mod routing;
 
 pub(crate) use console::recv_until_stop;
+pub use network::NetworkLogTracker;
 
 const MAX_LOG_ENTRIES: usize = 200;
 
@@ -48,12 +49,6 @@ pub struct NetworkEntry {
     pub failed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_text: Option<String>,
-}
-
-/// Bounded ring-buffer collector for `Network.*` events scoped to one `session_id`.
-#[derive(Debug, Clone)]
-pub struct NetworkLogTracker {
-    entries: Arc<Mutex<VecDeque<NetworkEntry>>>,
 }
 
 /// One route mock or abort rule for `Fetch.requestPaused`.

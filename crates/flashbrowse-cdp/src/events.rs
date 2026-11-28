@@ -6,6 +6,7 @@
 //! `Page.loadEventFired`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
 use serde_json::Value;
@@ -22,6 +23,23 @@ pub struct EventEnvelope {
     pub params: Value,
 }
 
+type ObserveEvent = dyn Fn(&str, &Value) + Send + Sync;
+
+/// Keeps a session event observer registered while held.
+pub struct SessionEventObserver {
+    session_id: String,
+    observe: Box<ObserveEvent>,
+}
+
+impl std::fmt::Debug for SessionEventObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionEventObserver")
+            .finish_non_exhaustive()
+    }
+}
+
+type ObserverList = Arc<Vec<Weak<SessionEventObserver>>>;
+
 /// Routes CDP events to subscribers by method name.
 ///
 /// `EventEmitter` is cheap to clone via `Arc`. Counters are lock-free
@@ -29,6 +47,7 @@ pub struct EventEnvelope {
 pub struct EventEmitter {
     subscribers: DashMap<String, Vec<broadcast::Sender<Value>>>,
     envelope_subscribers: DashMap<String, Vec<broadcast::Sender<EventEnvelope>>>,
+    observers: DashMap<String, ObserverList>,
     counts: DashMap<String, AtomicU64>,
 }
 
@@ -38,6 +57,7 @@ impl EventEmitter {
         Self {
             subscribers: DashMap::new(),
             envelope_subscribers: DashMap::new(),
+            observers: DashMap::new(),
             counts: DashMap::new(),
         }
     }
@@ -77,6 +97,33 @@ impl EventEmitter {
         receiver
     }
 
+    /// Observe selected methods for one session directly on the CDP reader.
+    /// Callbacks run in wire order and must be quick, synchronous, and free of I/O.
+    pub fn observe_session_events(
+        &self,
+        session_id: &str,
+        methods: &[&str],
+        observe: impl Fn(&str, &Value) + Send + Sync + 'static,
+    ) -> Arc<SessionEventObserver> {
+        let observer = Arc::new(SessionEventObserver {
+            session_id: session_id.to_string(),
+            observe: Box::new(observe),
+        });
+        for (index, &method) in methods.iter().enumerate() {
+            if methods
+                .get(..index)
+                .is_some_and(|prior| prior.contains(&method))
+            {
+                continue;
+            }
+            let mut observers = self.observers.entry(method.to_string()).or_default();
+            let observers = Arc::make_mut(&mut observers);
+            observers.retain(|observer| observer.strong_count() != 0);
+            observers.push(Arc::downgrade(&observer));
+        }
+        observer
+    }
+
     /// Emit an event `params` payload to all subscribers of `method`.
     ///
     /// Dead senders (dropped receivers) are removed lazily.
@@ -90,6 +137,25 @@ impl EventEmitter {
             crate::transport::drop_json_iteratively(params);
             tracing::warn!(method, "discarded CDP event with excessive JSON nesting");
             return;
+        }
+        if let Some(session_id) = session_id.as_deref() {
+            // Release the registry lock before calling observers.
+            let observers = self.observers.get(method).map(|entry| entry.clone());
+            if let Some(observers) = observers {
+                for observer in observers.iter().filter_map(Weak::upgrade) {
+                    if observer.session_id != session_id {
+                        continue;
+                    }
+                    if let Err(payload) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            (observer.observe)(method, &params);
+                        }))
+                    {
+                        crate::runtime::discard_panic_payload(payload);
+                        tracing::error!(method, "CDP event observer panicked");
+                    }
+                }
+            }
         }
         if let Some(mut senders) = self.subscribers.get_mut(method) {
             senders.retain(|s| s.receiver_count() > 0);

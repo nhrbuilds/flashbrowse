@@ -4,6 +4,20 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-28
+
+### Fixed
+- Record network requests and their responses in Chrome's event order. HTTP
+  failures remain visible in `browser_network` with `failed_only: true` during
+  request bursts, subject to the existing 200-entry log limit.
+- Exercise network log overflow without depending on task scheduling, and wait
+  for the expected response with a deadline in the browser integration test.
+
+### Changed
+- Split browser launch, transport, session, tree compression, and MCP code
+  into smaller modules. Moved usage, architecture, benchmarks, and contributor
+  instructions into dedicated guides.
+
 ## [1.5.0] - 2026-11-27
 
 ### Added
